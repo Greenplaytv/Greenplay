@@ -29,14 +29,31 @@ async function apiFetch<T>(path: string, init: RequestInit = {}): Promise<T> {
     headers.set('Content-Type', 'application/json');
   }
 
-  const res = await fetch(path, {
-    ...init,
-    headers,
-  });
+  let res: Response;
+  try {
+    res = await fetch(path, {
+      ...init,
+      headers,
+    });
+  } catch {
+    throw new Error('Falha de conexão ao comunicar com o servidor. Verifique sua internet e tente novamente.');
+  }
 
   const data = (await res.json().catch(() => ({}))) as T & {error?: string};
   if (!res.ok) {
-    throw new Error(data?.error || `Erro na requisição (${res.status}).`);
+    if (data?.error) {
+      throw new Error(data.error);
+    }
+    if (res.status === 404) {
+      throw new Error('Servidor ou rota da API não encontrada (HTTP 404).');
+    }
+    if (res.status === 401 || res.status === 403) {
+      throw new Error(`Credenciais inválidas ou acesso não autorizado (HTTP ${res.status}).`);
+    }
+    if (res.status >= 500) {
+      throw new Error(`Servidor indisponível no momento (HTTP ${res.status}).`);
+    }
+    throw new Error(`Erro na requisição (HTTP ${res.status}).`);
   }
   return data;
 }

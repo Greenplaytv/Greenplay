@@ -245,6 +245,22 @@ function isRestrictedHost(hostname: string): boolean {
   return false;
 }
 
+function normalizeServerInput(rawUrl: string): string {
+  const trimmed = rawUrl.trim().replace(/^["']+|["']+$/g, '');
+  if (!trimmed) return '';
+  if (!trimmed.includes('://') && !/^(javascript|data|vbscript|file|ftp|mailto):/i.test(trimmed)) {
+    return `http://${trimmed}`;
+  }
+  return trimmed;
+}
+
+function buildXtreamBaseOrigin(parsedUrl: URL): string {
+  let cleanPath = parsedUrl.pathname.replace(/\/+$/, '');
+  cleanPath = cleanPath.replace(/\/(player_api|panel_api|get|xmltv)\.php$/i, '');
+  cleanPath = cleanPath.replace(/\/+$/, '');
+  return `${parsedUrl.protocol}//${parsedUrl.host}${cleanPath === '/' ? '' : cleanPath}`;
+}
+
 export async function validateExternalUrl(rawUrl: string): Promise<URL> {
   const trimmed = rawUrl.trim();
   if (!trimmed || trimmed.length > 2048) {
@@ -255,7 +271,7 @@ export async function validateExternalUrl(rawUrl: string): Promise<URL> {
   try {
     parsed = new URL(trimmed);
   } catch {
-    throw new Error('Formato de URL inválido. Inclua http:// ou https://.');
+    throw new Error('Formato de URL inválido. Informe um domínio ou URL com http:// ou https://.');
   }
 
   if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
@@ -267,6 +283,52 @@ export async function validateExternalUrl(rawUrl: string): Promise<URL> {
   }
 
   return parsed;
+}
+
+class UpstreamFetchError extends Error {
+  statusCode: number;
+  constructor(message: string, statusCode: number) {
+    super(message);
+    this.name = 'UpstreamFetchError';
+    this.statusCode = statusCode;
+  }
+}
+
+function classifyFetchFailure(err: unknown, contextLabel: string): UpstreamFetchError {
+  if (err instanceof UpstreamFetchError) {
+    return err;
+  }
+  const msg = err instanceof Error ? err.message : '';
+  const name = err instanceof Error ? err.name : '';
+
+  if (
+    /inválid|permitidos|muito longa|privada ou local/i.test(msg)
+  ) {
+    return new UpstreamFetchError(msg, 400);
+  }
+
+  if (
+    name === 'TimeoutError' ||
+    name === 'AbortError' ||
+    /timeout|timed out|aborted/i.test(msg)
+  ) {
+    return new UpstreamFetchError(
+      `Falha de conexão: o servidor ${contextLabel} demorou para responder (tempo esgotado).`,
+      504,
+    );
+  }
+
+  if (/redirecionamentos/i.test(msg)) {
+    return new UpstreamFetchError(
+      `Falha de conexão: excesso de redirecionamentos no servidor ${contextLabel}.`,
+      502,
+    );
+  }
+
+  return new UpstreamFetchError(
+    `Falha de conexão com o servidor ${contextLabel}. Verifique o endereço DNS, protocolo (http/https) e porta.`,
+    502,
+  );
 }
 
 async function safeFetch(
@@ -282,8 +344,9 @@ async function safeFetch(
       method: 'GET',
       redirect: 'manual',
       headers: {
-        'User-Agent': 'GreenPlayTV/1.0',
-        Accept: '*/*',
+        'User-Agent':
+          'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+        Accept: 'application/json, text/plain, */*',
         ...(options.headers || {}),
       },
       signal: AbortSignal.timeout(options.timeoutMs ?? 15000),
@@ -294,6 +357,7 @@ async function safeFetch(
       if (!location) {
         return res;
       }
+      await res.body?.cancel().catch(() => {});
       currentUrl = new URL(location, validated).toString();
       continue;
     }
@@ -706,23 +770,43 @@ export async function handleApiRequest(request: Request, env: WorkerEnv): Promis
         return jsonResponse({error: 'Informe a URL do servidor, usuário e senha.'}, 400);
       }
 
-      const normalizedBase = body.serverUrl.trim().replace(/\/+$/, '');
-      const parsedUrl = await validateExternalUrl(normalizedBase);
-      const baseOrigin = `${parsedUrl.protocol}//${parsedUrl.host}${parsedUrl.pathname === '/' ? '' : parsedUrl.pathname}`;
+      const normalizedInput = normalizeServerInput(body.serverUrl);
+      const parsedUrl = await validateExternalUrl(normalizedInput);
+      const baseOrigin = buildXtreamBaseOrigin(parsedUrl);
 
       const authUrl = new URL(`${baseOrigin}/player_api.php`);
       authUrl.searchParams.set('username', body.username.trim());
       authUrl.searchParams.set('password', body.password);
 
-      const upstreamRes = await safeFetch(authUrl.toString(), {timeoutMs: 12000});
-      if (!upstreamRes.ok) {
+      let upstreamRes: Response;
+      try {
+        upstreamRes = await safeFetch(authUrl.toString(), {timeoutMs: 12000});
+      } catch (err) {
+        const classified = classifyFetchFailure(err, 'IPTV');
+        return jsonResponse({error: classified.message}, classified.statusCode);
+      }
+
+      if (upstreamRes.status === 404 || upstreamRes.status === 405 || upstreamRes.status === 410) {
         return jsonResponse(
-          {error: `O provedor IPTV recusou a conexão (HTTP ${upstreamRes.status}).`},
-          401,
+          {
+            error: `Servidor ou rota da API Xtream (/player_api.php) não encontrada (HTTP ${upstreamRes.status}). Verifique o DNS, o protocolo (http/https) e a porta, ou tente conectar pela aba "URL M3U Completa".`,
+          },
+          404,
         );
       }
 
-      let data: {
+      if (upstreamRes.status >= 500 || upstreamRes.status === 429) {
+        return jsonResponse(
+          {
+            error: `Servidor IPTV indisponível no momento (HTTP ${upstreamRes.status}). Tente novamente em alguns instantes.`,
+          },
+          503,
+        );
+      }
+
+      const rawBody = await upstreamRes.text().catch(() => '');
+
+      type XtreamAuthPayload = {
         user_info?: {
           auth?: number | string;
           status?: string;
@@ -732,18 +816,60 @@ export async function handleApiRequest(request: Request, env: WorkerEnv): Promis
           username?: string;
         };
       };
+
+      let data: XtreamAuthPayload | null = null;
       try {
-        data = (await upstreamRes.json()) as typeof data;
+        data = JSON.parse(rawBody) as XtreamAuthPayload;
       } catch {
+        data = null;
+      }
+
+      if (upstreamRes.status === 401) {
         return jsonResponse(
-          {error: 'O endereço informado não retornou uma API Xtream Codes válida.'},
-          400,
+          {error: 'Credenciais inválidas. Usuário ou senha IPTV incorretos (HTTP 401).'},
+          401,
+        );
+      }
+
+      if (upstreamRes.status === 403) {
+        if (data?.user_info && String(data.user_info.auth) !== '1') {
+          return jsonResponse(
+            {error: 'Credenciais inválidas. Usuário ou senha IPTV incorretos.'},
+            401,
+          );
+        }
+        return jsonResponse(
+          {
+            error:
+              'Acesso bloqueado pelo servidor IPTV (HTTP 403). Verifique suas credenciais ou se o provedor permite conexões externas.',
+          },
+          403,
+        );
+      }
+
+      if (!upstreamRes.ok) {
+        return jsonResponse(
+          {error: `Falha ao validar no servidor IPTV (HTTP ${upstreamRes.status}).`},
+          upstreamRes.status >= 400 && upstreamRes.status < 500 ? upstreamRes.status : 502,
+        );
+      }
+
+      if (!data || typeof data !== 'object') {
+        return jsonResponse(
+          {
+            error:
+              'Servidor encontrado, mas não retornou uma resposta Xtream Codes válida na rota /player_api.php.',
+          },
+          422,
         );
       }
 
       const userInfo = data?.user_info;
-      if (!userInfo || String(userInfo.auth) !== '1') {
-        return jsonResponse({error: 'Usuário ou senha IPTV inválidos.'}, 401);
+      if (!userInfo || Array.isArray(userInfo) || String(userInfo.auth) !== '1') {
+        return jsonResponse(
+          {error: 'Credenciais inválidas. Usuário ou senha IPTV incorretos.'},
+          401,
+        );
       }
 
       const status = String(userInfo.status || 'Active');
@@ -793,12 +919,43 @@ export async function handleApiRequest(request: Request, env: WorkerEnv): Promis
         return jsonResponse({error: 'Informe a URL completa da lista M3U.'}, 400);
       }
 
-      const parsed = await validateExternalUrl(body.m3uUrl);
-      const upstreamRes = await safeFetch(parsed.toString(), {timeoutMs: 20000});
+      const parsed = await validateExternalUrl(normalizeServerInput(body.m3uUrl));
+      let upstreamRes: Response;
+      try {
+        upstreamRes = await safeFetch(parsed.toString(), {timeoutMs: 20000});
+      } catch (err) {
+        const classified = classifyFetchFailure(err, 'da lista M3U');
+        return jsonResponse({error: classified.message}, classified.statusCode);
+      }
+
+      if (upstreamRes.status === 404 || upstreamRes.status === 410) {
+        return jsonResponse(
+          {
+            error: `Lista M3U não encontrada no endereço informado (HTTP ${upstreamRes.status}). Verifique a URL e os parâmetros.`,
+          },
+          404,
+        );
+      }
+      if (upstreamRes.status === 401 || upstreamRes.status === 403) {
+        return jsonResponse(
+          {
+            error: `Credenciais inválidas ou acesso não autorizado à lista M3U (HTTP ${upstreamRes.status}).`,
+          },
+          upstreamRes.status,
+        );
+      }
+      if (upstreamRes.status >= 500 || upstreamRes.status === 429) {
+        return jsonResponse(
+          {
+            error: `Servidor da lista M3U indisponível no momento (HTTP ${upstreamRes.status}). Tente novamente em instantes.`,
+          },
+          503,
+        );
+      }
       if (!upstreamRes.ok) {
         return jsonResponse(
           {error: `Não foi possível acessar a lista M3U (HTTP ${upstreamRes.status}).`},
-          401,
+          502,
         );
       }
 
@@ -1380,9 +1537,9 @@ export async function handleApiRequest(request: Request, env: WorkerEnv): Promis
       } satisfies GlobalSearchResponse);
     }
 
-    return jsonResponse({error: 'Rota da API não encontrada.'}, 404);
+    return jsonResponse({error: 'Rota interna da API não encontrada.'}, 404);
   } catch (err) {
-    const message = err instanceof Error ? err.message : 'Erro interno no servidor IPTV.';
-    return jsonResponse({error: message}, 400);
+    const classified = classifyFetchFailure(err, 'IPTV');
+    return jsonResponse({error: classified.message}, classified.statusCode);
   }
 }

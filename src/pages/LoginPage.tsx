@@ -20,12 +20,24 @@ export const LoginPage: React.FC<LoginPageProps> = ({onAuthenticated, onEnterDem
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const validateUrlSyntax = (value: string): boolean => {
+  const normalizeInputUrl = (value: string): string | null => {
+    const trimmed = value.trim().replace(/^["']+|["']+$/g, '');
+    if (!trimmed) return null;
+    const withProtocol =
+      !trimmed.includes('://') && !/^(javascript|data|vbscript|file|ftp|mailto):/i.test(trimmed)
+        ? `http://${trimmed}`
+        : trimmed;
     try {
-      const parsed = new URL(value.trim());
-      return parsed.protocol === 'http:' || parsed.protocol === 'https:';
+      const parsed = new URL(withProtocol);
+      if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+        return null;
+      }
+      if (!parsed.hostname || !parsed.hostname.includes('.')) {
+        return null;
+      }
+      return withProtocol;
     } catch {
-      return false;
+      return null;
     }
   };
 
@@ -41,15 +53,16 @@ export const LoginPage: React.FC<LoginPageProps> = ({onAuthenticated, onEnterDem
       return;
     }
 
-    if (!validateUrlSyntax(trimmedServer)) {
-      setError('Informe uma URL de servidor válida iniciando com http:// ou https://.');
+    const normalizedServer = normalizeInputUrl(trimmedServer);
+    if (!normalizedServer) {
+      setError('Informe um DNS ou URL de servidor válida (ex.: http://servidor.com:8080).');
       return;
     }
 
     setLoading(true);
     try {
       const {session} = await loginXtream({
-        serverUrl: trimmedServer,
+        serverUrl: normalizedServer,
         username: trimmedUser,
         password,
       });
@@ -58,7 +71,7 @@ export const LoginPage: React.FC<LoginPageProps> = ({onAuthenticated, onEnterDem
       setError(
         err instanceof Error
           ? err.message
-          : 'Não foi possível validar suas credenciais IPTV.',
+          : 'Não foi possível conectar ao servidor IPTV.',
       );
     } finally {
       setLoading(false);
@@ -74,14 +87,15 @@ export const LoginPage: React.FC<LoginPageProps> = ({onAuthenticated, onEnterDem
       setError('Informe a URL completa da sua lista M3U.');
       return;
     }
-    if (!validateUrlSyntax(trimmedM3U)) {
+    const normalizedM3U = normalizeInputUrl(trimmedM3U);
+    if (!normalizedM3U) {
       setError('Informe uma URL M3U válida iniciando com http:// ou https://.');
       return;
     }
 
     setLoading(true);
     try {
-      const {session} = await loginM3U({m3uUrl: trimmedM3U});
+      const {session} = await loginM3U({m3uUrl: normalizedM3U});
       onAuthenticated(session);
     } catch (err) {
       setError(
@@ -202,7 +216,7 @@ export const LoginPage: React.FC<LoginPageProps> = ({onAuthenticated, onEnterDem
                   <Server className="absolute left-3.5 top-1/2 -translate-y-1/2 h-4 w-4 text-[#75847C]" />
                   <input
                     id="iptv-server"
-                    type="url"
+                    type="text"
                     inputMode="url"
                     autoComplete="url"
                     placeholder="https://servidor-exemplo.com:8080"
