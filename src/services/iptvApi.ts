@@ -3,16 +3,28 @@ import type {
   CategoryItem,
   GlobalSearchResponse,
   HomeCatalogResponse,
+  HomeSectionResponse,
   MediaItem,
   MediaType,
   PaginatedCatalogResponse,
+  PlaybackSourceResponse,
   SeriesDetail,
 } from '../types/catalog';
 
 // Session token is held strictly in JS memory (never localStorage or sessionStorage)
 let inMemoryBearerToken: string | null = null;
+let authEpoch = 0;
+
+const CLIENT_CACHE_TTL_MS = 3 * 60 * 1000;
+const clientResponseCache = new Map<string, {data: unknown; expiresAt: number}>();
+const inflightGetRequests = new Map<string, Promise<unknown>>();
 
 export function setAuthToken(token: string | null) {
+  if (inMemoryBearerToken !== token) {
+    authEpoch += 1;
+    clientResponseCache.clear();
+    inflightGetRequests.clear();
+  }
   inMemoryBearerToken = token;
 }
 
@@ -20,42 +32,98 @@ export function hasAuthToken(): boolean {
   return Boolean(inMemoryBearerToken);
 }
 
-async function apiFetch<T>(path: string, init: RequestInit = {}): Promise<T> {
-  const headers = new Headers(init.headers);
-  if (inMemoryBearerToken) {
-    headers.set('Authorization', `Bearer ${inMemoryBearerToken}`);
-  }
-  if (init.body && !headers.has('Content-Type')) {
-    headers.set('Content-Type', 'application/json');
+async function apiFetch<T>(
+  path: string,
+  init: RequestInit = {},
+  options: {cacheTtlMs?: number} = {},
+): Promise<T> {
+  const method = (init.method || 'GET').toUpperCase();
+  const epochAtCall = authEpoch;
+  const cacheKey = `${epochAtCall}:${path}`;
+
+  if (method === 'GET' && options.cacheTtlMs) {
+    const cached = clientResponseCache.get(cacheKey);
+    if (cached && cached.expiresAt > Date.now()) {
+      return cached.data as T;
+    }
+    if (cached) {
+      clientResponseCache.delete(cacheKey);
+    }
   }
 
-  let res: Response;
-  try {
-    res = await fetch(path, {
-      ...init,
-      headers,
+  if (method === 'GET') {
+    const pending = inflightGetRequests.get(cacheKey) as Promise<T> | undefined;
+    if (pending) {
+      return pending;
+    }
+  }
+
+  const execute = async (): Promise<T> => {
+    const startedAt = performance.now();
+    const headers = new Headers(init.headers);
+    if (inMemoryBearerToken) {
+      headers.set('Authorization', `Bearer ${inMemoryBearerToken}`);
+    }
+    if (init.body && !headers.has('Content-Type')) {
+      headers.set('Content-Type', 'application/json');
+    }
+
+    let res: Response;
+    try {
+      res = await fetch(path, {
+        ...init,
+        headers,
+      });
+    } catch {
+      throw new Error(
+        'Falha de conexão ao comunicar com o servidor. Verifique sua internet e tente novamente.',
+      );
+    }
+
+    const durationMs = Math.round(performance.now() - startedAt);
+    const cleanEndpoint = path.split('?')[0];
+    console.info('[GreenPlay API]', {endpoint: cleanEndpoint, status: res.status, durationMs});
+
+    const data = (await res.json().catch(() => ({}))) as T & {error?: string};
+    if (!res.ok) {
+      if (data?.error) {
+        throw new Error(data.error);
+      }
+      if (res.status === 404) {
+        throw new Error('Servidor ou rota da API não encontrada (HTTP 404).');
+      }
+      if (res.status === 401 || res.status === 403) {
+        throw new Error(`Credenciais inválidas ou acesso não autorizado (HTTP ${res.status}).`);
+      }
+      if (res.status >= 500) {
+        throw new Error(`Servidor indisponível no momento (HTTP ${res.status}).`);
+      }
+      throw new Error(`Erro na requisição (HTTP ${res.status}).`);
+    }
+
+    if (method === 'GET' && options.cacheTtlMs && epochAtCall === authEpoch) {
+      clientResponseCache.set(cacheKey, {
+        data,
+        expiresAt: Date.now() + options.cacheTtlMs,
+      });
+      if (clientResponseCache.size > 120) {
+        const oldestKey = clientResponseCache.keys().next().value;
+        if (oldestKey) clientResponseCache.delete(oldestKey);
+      }
+    }
+
+    return data;
+  };
+
+  if (method === 'GET') {
+    const promise = execute().finally(() => {
+      inflightGetRequests.delete(cacheKey);
     });
-  } catch {
-    throw new Error('Falha de conexão ao comunicar com o servidor. Verifique sua internet e tente novamente.');
+    inflightGetRequests.set(cacheKey, promise);
+    return promise;
   }
 
-  const data = (await res.json().catch(() => ({}))) as T & {error?: string};
-  if (!res.ok) {
-    if (data?.error) {
-      throw new Error(data.error);
-    }
-    if (res.status === 404) {
-      throw new Error('Servidor ou rota da API não encontrada (HTTP 404).');
-    }
-    if (res.status === 401 || res.status === 403) {
-      throw new Error(`Credenciais inválidas ou acesso não autorizado (HTTP ${res.status}).`);
-    }
-    if (res.status >= 500) {
-      throw new Error(`Servidor indisponível no momento (HTTP ${res.status}).`);
-    }
-    throw new Error(`Erro na requisição (HTTP ${res.status}).`);
-  }
-  return data;
+  return execute();
 }
 
 export async function loginXtream(params: {
@@ -93,7 +161,24 @@ export async function logoutIptv(): Promise<void> {
 }
 
 export async function fetchHomeCatalog(): Promise<HomeCatalogResponse> {
-  return apiFetch<HomeCatalogResponse>('/api/iptv/home');
+  return apiFetch<HomeCatalogResponse>('/api/iptv/home', {}, {cacheTtlMs: CLIENT_CACHE_TTL_MS});
+}
+
+export async function fetchHomeSection(type: MediaType): Promise<HomeSectionResponse> {
+  return apiFetch<HomeSectionResponse>(
+    `/api/iptv/home-section?type=${encodeURIComponent(type)}`,
+    {},
+    {cacheTtlMs: CLIENT_CACHE_TTL_MS},
+  );
+}
+
+export async function fetchPlaybackSource(
+  type: MediaType,
+  id: string,
+): Promise<PlaybackSourceResponse> {
+  return apiFetch<PlaybackSourceResponse>(
+    `/api/iptv/play?type=${encodeURIComponent(type)}&id=${encodeURIComponent(id)}`,
+  );
 }
 
 export async function fetchCatalogPage(params: {
@@ -115,7 +200,11 @@ export async function fetchCatalogPage(params: {
   if (params.sort) search.set('sort', params.sort);
   if (params.page) search.set('page', String(params.page));
   if (params.limit) search.set('limit', String(params.limit));
-  return apiFetch<PaginatedCatalogResponse>(`/api/iptv/catalog?${search.toString()}`);
+  return apiFetch<PaginatedCatalogResponse>(
+    `/api/iptv/catalog?${search.toString()}`,
+    {},
+    {cacheTtlMs: CLIENT_CACHE_TTL_MS},
+  );
 }
 
 export async function fetchItemDetail(
@@ -124,11 +213,17 @@ export async function fetchItemDetail(
 ): Promise<{item: MediaItem | SeriesDetail; related: MediaItem[]}> {
   return apiFetch<{item: MediaItem | SeriesDetail; related: MediaItem[]}>(
     `/api/iptv/item/${encodeURIComponent(type)}/${encodeURIComponent(id)}`,
+    {},
+    {cacheTtlMs: CLIENT_CACHE_TTL_MS},
   );
 }
 
 export async function searchGlobalCatalog(q: string): Promise<GlobalSearchResponse> {
-  return apiFetch<GlobalSearchResponse>(`/api/iptv/search?q=${encodeURIComponent(q)}`);
+  return apiFetch<GlobalSearchResponse>(
+    `/api/iptv/search?q=${encodeURIComponent(q)}`,
+    {},
+    {cacheTtlMs: 60 * 1000},
+  );
 }
 
 export async function fetchOwnerLivePlaylist(): Promise<{
@@ -137,5 +232,5 @@ export async function fetchOwnerLivePlaylist(): Promise<{
   channels: MediaItem[];
   error?: string;
 }> {
-  return apiFetch('/api/iptv/owner-live');
+  return apiFetch('/api/iptv/owner-live', {}, {cacheTtlMs: CLIENT_CACHE_TTL_MS});
 }

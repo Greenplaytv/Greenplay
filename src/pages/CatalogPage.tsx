@@ -55,8 +55,12 @@ export const CatalogPage: React.FC<CatalogPageProps> = ({
     let active = true;
 
     const load = async () => {
-      if (page === 1) setLoading(true);
-      else setLoadingMore(true);
+      if (page === 1) {
+        setLoading(true);
+        setItems([]);
+      } else {
+        setLoadingMore(true);
+      }
       setError(null);
 
       try {
@@ -253,7 +257,7 @@ export const CatalogPage: React.FC<CatalogPageProps> = ({
       {/* Content Grid */}
       {loading ? (
         <GridSkeleton count={18} />
-      ) : error ? (
+      ) : error && items.length === 0 ? (
         <div className="py-20 text-center max-w-md mx-auto">
           <AlertCircle className="h-10 w-10 text-red-400 mx-auto mb-3" />
           <h2 className="font-display text-lg font-semibold text-white">
@@ -291,7 +295,21 @@ export const CatalogPage: React.FC<CatalogPageProps> = ({
             ))}
           </div>
 
-          {data && data.page < data.totalPages && (
+          {error && items.length > 0 && (
+            <div className="mt-8 flex flex-col items-center gap-2 text-center">
+              <p className="text-sm text-red-300">{error}</p>
+              <button
+                type="button"
+                onClick={() => setReloadTick((t) => t + 1)}
+                className="min-h-[40px] inline-flex items-center gap-2 px-4 rounded-xl bg-emerald-500/15 hover:bg-emerald-500/25 text-emerald-300 text-xs font-semibold cursor-pointer"
+              >
+                <RotateCcw className="h-3.5 w-3.5" />
+                <span>Tentar carregar mais novamente</span>
+              </button>
+            </div>
+          )}
+
+          {!error && (data?.hasMore || (data && data.page < data.totalPages)) && (
             <div className="mt-10 flex flex-col items-center gap-2">
               <button
                 type="button"
@@ -302,7 +320,9 @@ export const CatalogPage: React.FC<CatalogPageProps> = ({
                 {loadingMore ? 'Carregando...' : 'Carregar mais títulos'}
               </button>
               <span className="text-xs text-[#75847C] tabular-nums">
-                Página {data.page} de {data.totalPages}
+                {data.hasMore && data.page >= data.totalPages
+                  ? `Página ${data.page} · Mais categorias disponíveis`
+                  : `Página ${data.page} de ${data.totalPages}`}
               </span>
             </div>
           )}

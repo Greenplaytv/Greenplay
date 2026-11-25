@@ -33,9 +33,11 @@ export const LiveTVPage: React.FC<LiveTVPageProps> = ({
   const [channels, setChannels] = useState<MediaItem[]>([]);
   const [categories, setCategories] = useState<CategoryItem[]>([]);
   const [selectedCategory, setSelectedCategory] = useState(initialCategoryId);
-  const [searchQuery, setSearchQuery] = useState('');
+  const [searchInput, setSearchInput] = useState('');
+  const [debouncedQuery, setDebouncedQuery] = useState('');
   const [page, setPage] = useState(1);
   const [totalPages, setTotalPages] = useState(1);
+  const [hasMore, setHasMore] = useState(false);
   const [loading, setLoading] = useState(true);
   const [loadingMore, setLoadingMore] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -47,11 +49,23 @@ export const LiveTVPage: React.FC<LiveTVPageProps> = ({
   }, [initialCategoryId]);
 
   useEffect(() => {
+    const timer = window.setTimeout(() => {
+      setDebouncedQuery(searchInput);
+      setPage(1);
+    }, 280);
+    return () => window.clearTimeout(timer);
+  }, [searchInput]);
+
+  useEffect(() => {
     let active = true;
 
     const load = async () => {
-      if (page === 1) setLoading(true);
-      else setLoadingMore(true);
+      if (page === 1) {
+        setLoading(true);
+        setChannels([]);
+      } else {
+        setLoadingMore(true);
+      }
       setError(null);
 
       try {
@@ -62,16 +76,18 @@ export const LiveTVPage: React.FC<LiveTVPageProps> = ({
             setChannels([]);
             setCategories([]);
             setTotalPages(1);
+            setHasMore(false);
           } else {
             setCategories(ownerRes.categories);
             setChannels(ownerRes.channels);
             setTotalPages(1);
+            setHasMore(false);
           }
         } else {
           const res = await fetchCatalogPage({
             type: 'live',
             categoryId: selectedCategory,
-            q: searchQuery,
+            q: debouncedQuery,
             page,
             limit: 48,
           });
@@ -79,6 +95,7 @@ export const LiveTVPage: React.FC<LiveTVPageProps> = ({
           setCategories(res.categories);
           setChannels((prev) => (page === 1 ? res.items : [...prev, ...res.items]));
           setTotalPages(res.totalPages);
+          setHasMore(Boolean(res.hasMore));
         }
       } catch (err) {
         if (!active) return;
@@ -99,18 +116,18 @@ export const LiveTVPage: React.FC<LiveTVPageProps> = ({
     return () => {
       active = false;
     };
-  }, [isDemoMode, selectedCategory, searchQuery, page, reloadTick]);
+  }, [isDemoMode, selectedCategory, debouncedQuery, page, reloadTick]);
 
   const visibleChannels = useMemo(() => {
     if (!isDemoMode) return channels;
     return channels.filter((ch) => {
       const catOk = selectedCategory === 'all' || ch.categoryId === selectedCategory;
       const qOk =
-        !searchQuery.trim() ||
-        ch.title.toLowerCase().includes(searchQuery.trim().toLowerCase());
+        !debouncedQuery.trim() ||
+        ch.title.toLowerCase().includes(debouncedQuery.trim().toLowerCase());
       return catOk && qOk;
     });
-  }, [channels, isDemoMode, selectedCategory, searchQuery]);
+  }, [channels, isDemoMode, selectedCategory, debouncedQuery]);
 
   return (
     <div className="max-w-[1440px] mx-auto px-4 sm:px-8 lg:px-12 py-8 pb-16">
@@ -129,11 +146,8 @@ export const LiveTVPage: React.FC<LiveTVPageProps> = ({
             <Search className="absolute left-3.5 top-1/2 -translate-y-1/2 h-4 w-4 text-[#75847C]" />
             <input
               type="search"
-              value={searchQuery}
-              onChange={(e) => {
-                setSearchQuery(e.target.value);
-                setPage(1);
-              }}
+              value={searchInput}
+              onChange={(e) => setSearchInput(e.target.value)}
               placeholder="Buscar canal..."
               className="w-full min-h-[44px] pl-10 pr-4 rounded-xl bg-[#0D1210] border border-white/10 focus:border-emerald-500 focus:outline-none text-sm text-[#F3F6F4] placeholder:text-[#5F6D66]"
             />
@@ -180,7 +194,7 @@ export const LiveTVPage: React.FC<LiveTVPageProps> = ({
 
       {loading ? (
         <GridSkeleton count={12} />
-      ) : error ? (
+      ) : error && visibleChannels.length === 0 ? (
         <div className="py-20 text-center max-w-md mx-auto">
           <AlertCircle className="h-10 w-10 text-red-400 mx-auto mb-3" />
           <h2 className="font-display text-lg font-semibold text-white">
@@ -294,7 +308,21 @@ export const LiveTVPage: React.FC<LiveTVPageProps> = ({
             })}
           </div>
 
-          {!isDemoMode && page < totalPages && (
+          {error && visibleChannels.length > 0 && (
+            <div className="mt-8 flex flex-col items-center gap-2 text-center">
+              <p className="text-sm text-red-300">{error}</p>
+              <button
+                type="button"
+                onClick={() => setReloadTick((t) => t + 1)}
+                className="min-h-[40px] inline-flex items-center gap-2 px-4 rounded-xl bg-emerald-500/15 hover:bg-emerald-500/25 text-emerald-300 text-xs font-semibold cursor-pointer"
+              >
+                <RotateCcw className="h-3.5 w-3.5" />
+                <span>Tentar carregar mais novamente</span>
+              </button>
+            </div>
+          )}
+
+          {!isDemoMode && !error && (hasMore || page < totalPages) && (
             <div className="mt-10 flex justify-center">
               <button
                 type="button"

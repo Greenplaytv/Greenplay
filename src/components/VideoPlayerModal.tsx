@@ -20,11 +20,33 @@ import {
   VolumeX,
   X,
 } from 'lucide-react';
-import type {EpisodeItem, MediaItem, PlayerTarget} from '../types/catalog';
+import type {
+  EpisodeItem,
+  MediaItem,
+  MediaType,
+  PlaybackSourceResponse,
+  PlayerTarget,
+} from '../types/catalog';
 
 type VideoFitMode = 'contain' | 'cover' | 'fill';
+type StreamFormat = 'hls' | 'mp4' | 'mkv' | 'ts' | 'unsupported';
+type PlayerErrorCategory =
+  | 'network'
+  | 'timeout'
+  | 'format'
+  | 'invalid_url'
+  | 'mixed_content'
+  | 'provider_http';
+
+interface PlayerErrorState {
+  category: PlayerErrorCategory;
+  message: string;
+}
 
 const FIT_MODE_STORAGE_KEY = 'greenplay_player_fit_mode';
+const MAX_AUTO_RETRIES = 3;
+const RETRY_DELAYS_MS = [1200, 2200, 3500];
+const STARTUP_TIMEOUT_MS = 18000;
 
 const FIT_MODE_OPTIONS: {value: VideoFitMode; label: string; shortLabel: string}[] = [
   {value: 'contain', label: 'Ajustar (Original)', shortLabel: 'Ajustar'},
@@ -37,6 +59,7 @@ const INTRO_WINDOW_MAX_SECONDS = 300;
 
 interface VideoPlayerModalProps {
   target: PlayerTarget;
+  resolvePlaybackSource?: (type: MediaType, id: string) => Promise<PlaybackSourceResponse>;
   onClose: () => void;
   onProgress: (positionSeconds: number, durationSeconds: number, currentTarget: PlayerTarget) => void;
   onSelectEpisode?: (episode: EpisodeItem) => void;
@@ -54,8 +77,111 @@ function formatTime(totalSeconds: number): string {
   return h > 0 ? `${h}:${pad(m)}:${pad(s)}` : `${pad(m)}:${pad(s)}`;
 }
 
+function redactStreamUrlForLog(rawUrl: string): string {
+  try {
+    const parsed = new URL(rawUrl, window.location.origin);
+    parsed.username = '';
+    parsed.password = '';
+    const segments = parsed.pathname.split('/');
+    if (
+      segments.length >= 5 &&
+      (segments[1] === 'live' || segments[1] === 'movie' || segments[1] === 'series')
+    ) {
+      segments[2] = '***';
+      segments[3] = '***';
+      parsed.pathname = segments.join('/');
+    }
+    for (const key of ['username', 'password', 'user', 'pass', 'token', 'st']) {
+      if (parsed.searchParams.has(key)) {
+        parsed.searchParams.set(key, '***');
+      }
+    }
+    return parsed.toString();
+  } catch {
+    return '[url-redacted]';
+  }
+}
+
+function detectEffectiveFormat(
+  src: string,
+  hintedFormat: PlayerTarget['streamFormat'],
+  mediaType: MediaType,
+): StreamFormat {
+  const cleanPath = src.split('?')[0].split('#')[0].trim().toLowerCase();
+  if (cleanPath.endsWith('.m3u8') || cleanPath.includes('.m3u8') || hintedFormat === 'hls') {
+    return 'hls';
+  }
+  if (/\.(mp4|m4v|mov|webm)$/.test(cleanPath)) return 'mp4';
+  if (cleanPath.endsWith('.mkv') || hintedFormat === 'mkv') return 'mkv';
+  if (cleanPath.endsWith('.ts') || hintedFormat === 'ts') return 'ts';
+  if (
+    /\.(avi|flv|wmv|mpg|mpeg|vob|divx)$/.test(cleanPath) ||
+    hintedFormat === 'unsupported'
+  ) {
+    return 'unsupported';
+  }
+  if (mediaType === 'live' && !hintedFormat) return 'hls';
+  return hintedFormat || 'mp4';
+}
+
+function checkBrowserCanPlayFormat(
+  video: HTMLVideoElement,
+  format: StreamFormat,
+): {supported: boolean; reason?: string} {
+  if (format === 'unsupported') {
+    return {
+      supported: false,
+      reason:
+        'Formato de vídeo incompatível com navegadores (AVI/FLV/WMV/MPEG). Utilize conteúdos em MP4 ou HLS (.m3u8).',
+    };
+  }
+  if (format === 'ts') {
+    const canTs = video.canPlayType('video/mp2t');
+    if (!canTs) {
+      return {
+        supported: false,
+        reason:
+          'Transmissão em fluxo MPEG-TS (.ts) não é suportada diretamente pelo navegador. Selecione um canal ou vídeo em HLS (.m3u8) ou MP4.',
+      };
+    }
+    return {supported: true};
+  }
+  if (format === 'mkv') {
+    const canMkv =
+      video.canPlayType('video/x-matroska; codecs="avc1.42E01E, mp4a.40.2"') ||
+      video.canPlayType('video/x-matroska') ||
+      video.canPlayType('video/webm; codecs="vp8, opus"');
+    if (!canMkv) {
+      return {
+        supported: false,
+        reason:
+          'Este navegador não oferece suporte nativo ao formato MKV. Experimente um título em MP4 ou HLS (.m3u8).',
+      };
+    }
+    return {supported: true};
+  }
+  if (format === 'hls') {
+    if (Hls.isSupported() || video.canPlayType('application/vnd.apple.mpegurl')) {
+      return {supported: true};
+    }
+    return {
+      supported: false,
+      reason: 'Reprodução HLS (.m3u8) não suportada neste navegador.',
+    };
+  }
+  const canMp4 = video.canPlayType('video/mp4');
+  if (!canMp4) {
+    return {
+      supported: false,
+      reason: 'Reprodução MP4 não suportada neste navegador.',
+    };
+  }
+  return {supported: true};
+}
+
 export const VideoPlayerModal: React.FC<VideoPlayerModalProps> = ({
   target,
+  resolvePlaybackSource,
   onClose,
   onProgress,
   onSelectEpisode,
@@ -67,9 +193,22 @@ export const VideoPlayerModal: React.FC<VideoPlayerModalProps> = ({
   const hlsRef = useRef<Hls | null>(null);
   const lastSavedAtRef = useRef<number>(0);
 
+  // Concurrency & retry guards
+  const playbackSessionIdRef = useRef<number>(0);
+  const retryTimerRef = useRef<number | null>(null);
+  const startupTimerRef = useRef<number | null>(null);
+  const autoRetryCountRef = useRef<number>(0);
+  const initialResumeRef = useRef<number | undefined>(target.resumeAtSeconds);
+  const resolvePlaybackRef = useRef(resolvePlaybackSource);
+  resolvePlaybackRef.current = resolvePlaybackSource;
+
   const [isPlaying, setIsPlaying] = useState(false);
-  const [isLoading, setIsLoading] = useState(Boolean(target.streamUrl));
-  const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [isLoading, setIsLoading] = useState(!target.isDemo);
+  const [statusNotice, setStatusNotice] = useState<string | null>(null);
+  const [errorState, setErrorState] = useState<PlayerErrorState | null>(null);
+  const [sourceUnavailable, setSourceUnavailable] = useState(false);
+  const [hasActiveSource, setHasActiveSource] = useState(Boolean(target.streamUrl));
+
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
   const [volume, setVolume] = useState(1);
@@ -90,9 +229,16 @@ export const VideoPlayerModal: React.FC<VideoPlayerModalProps> = ({
   });
   const [showFitMenu, setShowFitMenu] = useState(false);
   const [introSkipped, setIntroSkipped] = useState(false);
-  const [retrySeed, setRetrySeed] = useState(0);
+  const [attemptSeed, setAttemptSeed] = useState(0);
 
   const controlsTimerRef = useRef<number | null>(null);
+  const targetIdentityKey = `${target.mediaType}:${target.id}:${target.episodeId || ''}:${target.streamUrl || ''}`;
+
+  // Update initial resume target only when switching to a different movie/episode/channel
+  useEffect(() => {
+    initialResumeRef.current = target.resumeAtSeconds;
+    autoRetryCountRef.current = 0;
+  }, [targetIdentityKey, target.resumeAtSeconds]);
 
   const nextEpisode = useMemo(() => {
     if (!target.episodesQueue || !target.episodeId) return null;
@@ -131,102 +277,440 @@ export const VideoPlayerModal: React.FC<VideoPlayerModalProps> = ({
     [onProgress, target],
   );
 
-  // Initialize playback when streamUrl or retrySeed changes
-  useEffect(() => {
-    const video = videoRef.current;
-    if (!video || !target.streamUrl) {
-      setIsLoading(false);
-      return;
+  // Full media & timer teardown helper to ensure no stale sockets or overlapping sessions
+  const teardownPlayback = useCallback(() => {
+    if (retryTimerRef.current) {
+      window.clearTimeout(retryTimerRef.current);
+      retryTimerRef.current = null;
     }
+    if (startupTimerRef.current) {
+      window.clearTimeout(startupTimerRef.current);
+      startupTimerRef.current = null;
+    }
+    if (hlsRef.current) {
+      hlsRef.current.destroy();
+      hlsRef.current = null;
+    }
+    const video = videoRef.current;
+    if (video) {
+      video.pause();
+      video.removeAttribute('src');
+      video.load();
+    }
+  }, []);
 
-    setErrorMessage(null);
-    setIsLoading(true);
+  // Initialize playback when item or attemptSeed changes
+  useEffect(() => {
+    const sessionId = ++playbackSessionIdRef.current;
+    teardownPlayback();
+
+    setErrorState(null);
+    setStatusNotice(null);
+    setSourceUnavailable(false);
+    setIsPlaying(false);
     setCurrentTime(0);
     setDuration(0);
     setIntroSkipped(false);
     setShowFitMenu(false);
 
-    if (hlsRef.current) {
-      hlsRef.current.destroy();
-      hlsRef.current = null;
+    if (target.isDemo && !target.streamUrl) {
+      setHasActiveSource(false);
+      setSourceUnavailable(true);
+      setIsLoading(false);
+      return;
     }
 
-    const src = target.streamUrl;
-    const shouldUseHls =
-      target.streamFormat === 'hls' ||
-      src.toLowerCase().includes('.m3u8') ||
-      target.mediaType === 'live';
+    setIsLoading(true);
+    setHasActiveSource(true);
 
-    const applyResume = () => {
-      if (
-        target.mediaType !== 'live' &&
-        target.resumeAtSeconds &&
-        target.resumeAtSeconds > 5 &&
-        video.duration > target.resumeAtSeconds + 5
-      ) {
-        video.currentTime = target.resumeAtSeconds;
+    let localCleanup: (() => void) | null = null;
+
+    const handleFailure = (
+      category: PlayerErrorCategory,
+      message: string,
+      recoverable: boolean,
+      formatLabel: string,
+      redactedUrl: string,
+    ) => {
+      if (playbackSessionIdRef.current !== sessionId) return;
+
+      const currentRetries = autoRetryCountRef.current;
+      console.warn('[GreenPlay Player] Playback error', {
+        errorType: category,
+        format: formatLabel,
+        attempt: currentRetries + 1,
+        recoverable,
+        url: redactedUrl,
+      });
+
+      if (recoverable && currentRetries < MAX_AUTO_RETRIES) {
+        const nextRetryNum = currentRetries + 1;
+        autoRetryCountRef.current = nextRetryNum;
+        const delayMs = RETRY_DELAYS_MS[nextRetryNum - 1] || 3000;
+        teardownPlayback();
+        setIsLoading(true);
+        setStatusNotice(
+          `Instabilidade temporária detectada. Reconectando (${nextRetryNum}/${MAX_AUTO_RETRIES})...`,
+        );
+
+        retryTimerRef.current = window.setTimeout(() => {
+          if (playbackSessionIdRef.current !== sessionId) return;
+          setAttemptSeed((s) => s + 1);
+        }, delayMs);
+        return;
       }
+
+      teardownPlayback();
+      setIsLoading(false);
+      setStatusNotice(null);
+      setErrorState({category, message});
     };
 
-    if (shouldUseHls && Hls.isSupported()) {
-      const hls = new Hls({
-        enableWorker: true,
-        lowLatencyMode: target.mediaType === 'live',
-        backBufferLength: 60,
-      });
-      hlsRef.current = hls;
-      hls.loadSource(src);
-      hls.attachMedia(video);
+    const startPlayback = async () => {
+      let src = target.streamUrl?.trim() || '';
+      let hintedFormat = target.streamFormat;
 
-      hls.on(Hls.Events.MANIFEST_PARSED, () => {
-        setIsLoading(false);
-        applyResume();
-        video.play().catch(() => {
-          // Autoplay may be blocked until user taps play
-        });
-      });
-
-      hls.on(Hls.Events.ERROR, (_event, data) => {
-        if (!data.fatal) return;
-        if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
-          setErrorMessage('Falha de rede ao carregar o stream. Verifique sua conexão ou lista IPTV.');
-          setIsLoading(false);
-        } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
-          hls.recoverMediaError();
-        } else {
-          setErrorMessage('Formato de mídia incompatível ou transmissão indisponível.');
-          setIsLoading(false);
+      if (!src && resolvePlaybackRef.current && !target.isDemo) {
+        try {
+          const resolvedId =
+            target.mediaType === 'series' && target.episodeId ? target.episodeId : target.id;
+          const resolved = await resolvePlaybackRef.current(target.mediaType, resolvedId);
+          if (playbackSessionIdRef.current !== sessionId) return;
+          src = resolved.streamUrl?.trim() || '';
+          hintedFormat = resolved.streamFormat || hintedFormat;
+        } catch (err) {
+          if (playbackSessionIdRef.current !== sessionId) return;
+          const msg =
+            err instanceof Error
+              ? err.message
+              : 'Falha ao obter endereço de reprodução do provedor.';
+          handleFailure('network', msg, true, hintedFormat || 'unknown', '[unresolved]');
+          return;
         }
+      }
+
+      if (playbackSessionIdRef.current !== sessionId) return;
+
+      if (!src) {
+        setHasActiveSource(false);
+        setSourceUnavailable(true);
+        setIsLoading(false);
+        return;
+      }
+
+      // Validate playback URL syntax before attempting playback
+      let parsedUrl: URL;
+      try {
+        parsedUrl = new URL(src, window.location.origin);
+        if (parsedUrl.protocol !== 'http:' && parsedUrl.protocol !== 'https:') {
+          throw new Error('Protocolo não suportado.');
+        }
+        if (parsedUrl.pathname === '/' && !parsedUrl.search) {
+          throw new Error('Endereço sem caminho de mídia.');
+        }
+      } catch {
+        handleFailure(
+          'invalid_url',
+          'O provedor retornou uma URL de reprodução inválida ou incompleta.',
+          false,
+          hintedFormat || 'unknown',
+          '[invalid-url]',
+        );
+        return;
+      }
+
+      const video = videoRef.current;
+      if (!video) return;
+
+      const format = detectEffectiveFormat(src, hintedFormat, target.mediaType);
+      const redactedUrl = redactStreamUrlForLog(src);
+      const attemptNumber = autoRetryCountRef.current + 1;
+
+      console.info('[GreenPlay Player] Initializing', {
+        mediaType: target.mediaType,
+        id: target.episodeId || target.id,
+        format,
+        attempt: attemptNumber,
+        url: redactedUrl,
       });
-    } else {
-      video.src = src;
-      const onLoadedMetadata = () => {
-        setIsLoading(false);
-        applyResume();
-        video.play().catch(() => {});
+
+      // Verify browser compatibility before attempting playback (blocks MKV/AVI/TS when unsupported)
+      const compat = checkBrowserCanPlayFormat(video, format);
+      if (!compat.supported) {
+        handleFailure(
+          'format',
+          compat.reason || 'Formato de vídeo não suportado pelo navegador.',
+          false,
+          format,
+          redactedUrl,
+        );
+        return;
+      }
+
+      const isMixedContent =
+        window.location.protocol === 'https:' && parsedUrl.protocol === 'http:';
+
+      const applyResume = () => {
+        const resumePos = initialResumeRef.current;
+        if (
+          target.mediaType !== 'live' &&
+          resumePos &&
+          resumePos > 5 &&
+          Number.isFinite(video.duration) &&
+          video.duration > resumePos + 5
+        ) {
+          video.currentTime = resumePos;
+        }
       };
-      const onError = () => {
+
+      const clearStartupTimer = () => {
+        if (startupTimerRef.current) {
+          window.clearTimeout(startupTimerRef.current);
+          startupTimerRef.current = null;
+        }
+      };
+
+      // Guard against indefinite hung requests during initialization
+      startupTimerRef.current = window.setTimeout(() => {
+        if (playbackSessionIdRef.current !== sessionId) return;
+        handleFailure(
+          'timeout',
+          'Tempo esgotado ao carregar o vídeo do provedor IPTV. O servidor demorou para responder.',
+          true,
+          format,
+          redactedUrl,
+        );
+      }, STARTUP_TIMEOUT_MS);
+
+      const useHlsJs = format === 'hls' && Hls.isSupported();
+
+      if (useHlsJs && isMixedContent) {
+        // Check native HLS fallback (Safari) before failing on Mixed Content XHR block
+        if (!video.canPlayType('application/vnd.apple.mpegurl')) {
+          clearStartupTimer();
+          handleFailure(
+            'mixed_content',
+            'Este fluxo HLS usa HTTP sem HTTPS, o que é bloqueado pelo navegador em páginas HTTPS. Verifique se seu provedor oferece DNS com HTTPS.',
+            false,
+            format,
+            redactedUrl,
+          );
+          return;
+        }
+      }
+
+      if (useHlsJs && !isMixedContent) {
+        let mediaRecoveredOnce = false;
+        const hls = new Hls({
+          enableWorker: true,
+          lowLatencyMode: target.mediaType === 'live',
+          backBufferLength: 60,
+          manifestLoadingTimeOut: 14000,
+          levelLoadingTimeOut: 14000,
+          fragLoadingTimeOut: 18000,
+          manifestLoadingMaxRetry: 1,
+          fragLoadingMaxRetry: 1,
+        });
+        hlsRef.current = hls;
+
+        const onVideoError = () => {
+          if (playbackSessionIdRef.current !== sessionId) return;
+          clearStartupTimer();
+          const mediaErr = video.error;
+          if (mediaErr?.code === MediaError.MEDIA_ERR_DECODE || mediaErr?.code === MediaError.MEDIA_ERR_SRC_NOT_SUPPORTED) {
+            handleFailure(
+              'format',
+              'O navegador não conseguiu decodificar este stream HLS (codec de vídeo/áudio incompatível).',
+              false,
+              format,
+              redactedUrl,
+            );
+          } else {
+            handleFailure(
+              'network',
+              'Falha de rede durante a reprodução do fluxo HLS.',
+              true,
+              format,
+              redactedUrl,
+            );
+          }
+        };
+
+        video.addEventListener('error', onVideoError);
+        localCleanup = () => {
+          video.removeEventListener('error', onVideoError);
+        };
+
+        hls.on(Hls.Events.MANIFEST_PARSED, () => {
+          if (playbackSessionIdRef.current !== sessionId) return;
+          clearStartupTimer();
+          setIsLoading(false);
+          setStatusNotice(null);
+          applyResume();
+          video.play().catch((playErr) => {
+            if (playbackSessionIdRef.current !== sessionId) return;
+            if (playErr instanceof Error && playErr.name === 'NotAllowedError') {
+              setIsPlaying(false);
+            }
+          });
+        });
+
+        hls.on(Hls.Events.ERROR, (_event, data) => {
+          if (playbackSessionIdRef.current !== sessionId || !data.fatal) return;
+          clearStartupTimer();
+          const httpCode = data.response?.code;
+
+          if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
+            if (httpCode === 401 || httpCode === 403 || httpCode === 404 || httpCode === 410) {
+              handleFailure(
+                'provider_http',
+                `O servidor IPTV recusou ou não encontrou o fluxo de vídeo (HTTP ${httpCode}).`,
+                false,
+                format,
+                redactedUrl,
+              );
+              return;
+            }
+            if (httpCode === 0) {
+              handleFailure(
+                'network',
+                'Não foi possível acessar o fluxo HLS no navegador (bloqueio de CORS ou falha de conexão com o provedor).',
+                true,
+                format,
+                redactedUrl,
+              );
+              return;
+            }
+            handleFailure(
+              'network',
+              `Erro de rede ao carregar o stream HLS${httpCode ? ` (HTTP ${httpCode})` : ''}.`,
+              true,
+              format,
+              redactedUrl,
+            );
+            return;
+          }
+
+          if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
+            if (!mediaRecoveredOnce) {
+              mediaRecoveredOnce = true;
+              hls.recoverMediaError();
+              return;
+            }
+            handleFailure(
+              'format',
+              'Erro de decodificação de mídia no stream HLS. O codec pode ser incompatível com o navegador.',
+              false,
+              format,
+              redactedUrl,
+            );
+            return;
+          }
+
+          handleFailure(
+            'format',
+            'Não foi possível inicializar o stream HLS no navegador.',
+            false,
+            format,
+            redactedUrl,
+          );
+        });
+
+        hls.loadSource(src);
+        hls.attachMedia(video);
+        return;
+      }
+
+      // Native HTML5 playback (MP4, Safari native HLS, or browser-supported MKV)
+      const onLoadedMetadata = () => {
+        if (playbackSessionIdRef.current !== sessionId) return;
+        clearStartupTimer();
+        setDuration(Number.isFinite(video.duration) ? video.duration : 0);
         setIsLoading(false);
-        setErrorMessage(
-          'Não foi possível reproduzir este conteúdo no navegador. Verifique se o formato é suportado pelo provedor.',
+        setStatusNotice(null);
+        applyResume();
+        video.play().catch((playErr) => {
+          if (playbackSessionIdRef.current !== sessionId) return;
+          if (playErr instanceof Error && playErr.name === 'NotAllowedError') {
+            setIsPlaying(false);
+          }
+        });
+      };
+
+      const onCanPlay = () => {
+        if (playbackSessionIdRef.current !== sessionId) return;
+        clearStartupTimer();
+        setIsLoading(false);
+        setStatusNotice(null);
+      };
+
+      const onNativeError = () => {
+        if (playbackSessionIdRef.current !== sessionId) return;
+        clearStartupTimer();
+        const code = video.error?.code;
+
+        if (code === MediaError.MEDIA_ERR_NETWORK) {
+          handleFailure(
+            isMixedContent ? 'mixed_content' : 'network',
+            isMixedContent
+              ? 'Falha ao carregar vídeo HTTP em página HTTPS (Mixed Content) ou queda na rede.'
+              : 'Falha de rede ao carregar o vídeo do provedor IPTV.',
+            !isMixedContent,
+            format,
+            redactedUrl,
+          );
+          return;
+        }
+
+        if (code === MediaError.MEDIA_ERR_DECODE || code === MediaError.MEDIA_ERR_SRC_NOT_SUPPORTED) {
+          if (isMixedContent) {
+            handleFailure(
+              'mixed_content',
+              'O link do vídeo utiliza HTTP em uma página HTTPS ou o formato não é compatível com o navegador.',
+              false,
+              format,
+              redactedUrl,
+            );
+            return;
+          }
+          const formatHint =
+            format === 'mkv'
+              ? 'Arquivo MKV com codec de vídeo/áudio (como HEVC ou AC3) incompatível com o navegador.'
+              : 'Formato ou codec de vídeo incompatível com este navegador, ou resposta inválida do servidor IPTV.';
+          handleFailure('format', formatHint, false, format, redactedUrl);
+          return;
+        }
+
+        handleFailure(
+          'network',
+          'Erro inesperado ao iniciar a reprodução do vídeo.',
+          true,
+          format,
+          redactedUrl,
         );
       };
-      video.addEventListener('loadedmetadata', onLoadedMetadata);
-      video.addEventListener('error', onError);
 
-      return () => {
+      video.addEventListener('loadedmetadata', onLoadedMetadata);
+      video.addEventListener('canplay', onCanPlay);
+      video.addEventListener('error', onNativeError);
+      localCleanup = () => {
         video.removeEventListener('loadedmetadata', onLoadedMetadata);
-        video.removeEventListener('error', onError);
+        video.removeEventListener('canplay', onCanPlay);
+        video.removeEventListener('error', onNativeError);
       };
-    }
+
+      video.src = src;
+      video.load();
+    };
+
+    void startPlayback();
 
     return () => {
-      if (hlsRef.current) {
-        hlsRef.current.destroy();
-        hlsRef.current = null;
-      }
+      playbackSessionIdRef.current += 1;
+      localCleanup?.();
+      teardownPlayback();
     };
-  }, [target.streamUrl, target.streamFormat, target.mediaType, target.resumeAtSeconds, retrySeed]);
+  }, [targetIdentityKey, target.isDemo, target.mediaType, target.id, target.episodeId, target.streamFormat, target.streamUrl, attemptSeed, teardownPlayback]);
 
   // Save final position on unmount or target switch
   useEffect(() => {
@@ -253,12 +737,12 @@ export const VideoPlayerModal: React.FC<VideoPlayerModalProps> = ({
         if (showFitMenu) setShowFitMenu(false);
         else if (drawerMode !== 'none') setDrawerMode('none');
         else onClose();
-      } else if (e.key === ' ' && target.streamUrl) {
+      } else if (e.key === ' ' && hasActiveSource) {
         e.preventDefault();
         togglePlay();
-      } else if ((e.key === 'f' || e.key === 'F') && target.streamUrl) {
+      } else if ((e.key === 'f' || e.key === 'F') && hasActiveSource) {
         toggleFullscreen();
-      } else if ((e.key === 'm' || e.key === 'M') && target.streamUrl) {
+      } else if ((e.key === 'm' || e.key === 'M') && hasActiveSource) {
         toggleMute();
       }
     };
@@ -347,7 +831,17 @@ export const VideoPlayerModal: React.FC<VideoPlayerModalProps> = ({
     scheduleHideControls();
   };
 
+  const handleManualRetry = () => {
+    teardownPlayback();
+    autoRetryCountRef.current = 0;
+    setErrorState(null);
+    setStatusNotice(null);
+    setIsLoading(true);
+    setAttemptSeed((s) => s + 1);
+  };
+
   const handleClose = () => {
+    teardownPlayback();
     flushProgress(true);
     onClose();
   };
@@ -361,8 +855,9 @@ export const VideoPlayerModal: React.FC<VideoPlayerModalProps> = ({
 
   const canSkipIntro =
     target.mediaType !== 'live' &&
-    Boolean(target.streamUrl) &&
-    !errorMessage &&
+    hasActiveSource &&
+    !sourceUnavailable &&
+    !errorState &&
     !introSkipped &&
     currentTime < INTRO_WINDOW_MAX_SECONDS &&
     (duration === 0 || currentTime + 15 < duration);
@@ -383,7 +878,7 @@ export const VideoPlayerModal: React.FC<VideoPlayerModalProps> = ({
       {/* Top Overlay Header */}
       <div
         className={`relative z-30 flex items-center justify-between gap-4 px-4 sm:px-6 py-4 bg-gradient-to-b from-black/90 via-black/50 to-transparent transition-opacity duration-200 ${
-          showControls || !target.streamUrl || errorMessage ? 'opacity-100' : 'opacity-0 pointer-events-none'
+          showControls || sourceUnavailable || errorState ? 'opacity-100' : 'opacity-0 pointer-events-none'
         }`}
       >
         <div className="flex items-center gap-3 min-w-0">
@@ -432,7 +927,7 @@ export const VideoPlayerModal: React.FC<VideoPlayerModalProps> = ({
 
       {/* Main Video Stage */}
       <div className="absolute inset-0 flex items-center justify-center bg-black">
-        {!target.streamUrl ? (
+        {sourceUnavailable ? (
           /* Clean Unavailable Source State (Zero fake playback links) */
           <div className="relative z-20 max-w-md mx-auto px-6 text-center">
             <div className="mx-auto mb-5 h-14 w-14 rounded-2xl border border-emerald-500/30 bg-emerald-500/10 flex items-center justify-center">
@@ -480,7 +975,10 @@ export const VideoPlayerModal: React.FC<VideoPlayerModalProps> = ({
                 flushProgress(true);
               }}
               onWaiting={() => setIsLoading(true)}
-              onPlaying={() => setIsLoading(false)}
+              onPlaying={() => {
+                setIsLoading(false);
+                setStatusNotice(null);
+              }}
               onTimeUpdate={() => {
                 if (!videoRef.current) return;
                 setCurrentTime(videoRef.current.currentTime);
@@ -488,29 +986,36 @@ export const VideoPlayerModal: React.FC<VideoPlayerModalProps> = ({
               }}
               onLoadedMetadata={() => {
                 if (!videoRef.current) return;
-                setDuration(videoRef.current.duration || 0);
+                setDuration(
+                  Number.isFinite(videoRef.current.duration) ? videoRef.current.duration : 0,
+                );
               }}
               className={`w-full h-full max-w-full max-h-full ${videoFitClass}`}
             />
 
-            {isLoading && !errorMessage && (
-              <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
+            {isLoading && !errorState && (
+              <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 pointer-events-none px-6 text-center">
                 <div className="h-12 w-12 rounded-full border-2 border-emerald-500/30 border-t-emerald-400 animate-spin" />
+                {statusNotice && (
+                  <p className="text-xs sm:text-sm text-[#D1DBD5] bg-black/75 px-3.5 py-1.5 rounded-lg border border-white/10">
+                    {statusNotice}
+                  </p>
+                )}
               </div>
             )}
 
-            {errorMessage && (
+            {errorState && (
               <div className="absolute inset-0 z-20 flex items-center justify-center bg-black/85 p-6">
                 <div className="max-w-md text-center">
                   <AlertCircle className="h-10 w-10 text-red-400 mx-auto mb-3" />
                   <h3 className="font-display text-lg font-semibold text-white">
                     Erro na reprodução
                   </h3>
-                  <p className="mt-2 text-sm text-[#B7C4BC]">{errorMessage}</p>
+                  <p className="mt-2 text-sm text-[#B7C4BC]">{errorState.message}</p>
                   <div className="mt-5 flex items-center justify-center gap-3">
                     <button
                       type="button"
-                      onClick={() => setRetrySeed((s) => s + 1)}
+                      onClick={handleManualRetry}
                       className="min-h-[44px] inline-flex items-center gap-2 px-5 py-2.5 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-[#04120B] font-semibold text-sm cursor-pointer"
                     >
                       <RotateCcw className="h-4 w-4" />
@@ -532,7 +1037,7 @@ export const VideoPlayerModal: React.FC<VideoPlayerModalProps> = ({
       </div>
 
       {/* Bottom Controls Bar */}
-      {target.streamUrl && !errorMessage && (
+      {hasActiveSource && !sourceUnavailable && !errorState && (
         <div
           className={`relative z-30 px-4 sm:px-6 pb-5 pt-10 bg-gradient-to-t from-black/95 via-black/65 to-transparent transition-opacity duration-200 ${
             showControls || showFitMenu ? 'opacity-100' : 'opacity-0 pointer-events-none'

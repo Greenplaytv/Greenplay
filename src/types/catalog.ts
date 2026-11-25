@@ -21,7 +21,7 @@ export interface MediaItem {
   durationSeconds?: number;
   rating?: string;
   streamUrl?: string;
-  streamFormat?: 'hls' | 'mp4' | 'ts';
+  streamFormat?: 'hls' | 'mp4' | 'mkv' | 'ts' | 'unsupported';
   channelNumber?: number;
   isDemo?: boolean;
 }
@@ -37,7 +37,7 @@ export interface EpisodeItem {
   durationSeconds?: number;
   thumbnail?: string;
   streamUrl?: string;
-  streamFormat?: 'hls' | 'mp4' | 'ts';
+  streamFormat?: 'hls' | 'mp4' | 'mkv' | 'ts' | 'unsupported';
   isDemo?: boolean;
 }
 
@@ -98,11 +98,19 @@ export interface HomeCatalogResponse {
   };
 }
 
+export interface HomeSectionResponse {
+  type: MediaType;
+  categories: CategoryItem[];
+  items: MediaItem[];
+  recentlyAdded: MediaItem[];
+}
+
 export interface PaginatedCatalogResponse {
   items: MediaItem[];
   total: number;
   page: number;
   totalPages: number;
+  hasMore?: boolean;
   categories: CategoryItem[];
   years: string[];
   genres: string[];
@@ -115,6 +123,11 @@ export interface GlobalSearchResponse {
   episodes: (EpisodeItem & { seriesTitle: string; seriesPoster: string })[];
 }
 
+export interface PlaybackSourceResponse {
+  streamUrl: string;
+  streamFormat: 'hls' | 'mp4' | 'mkv' | 'ts' | 'unsupported';
+}
+
 export interface PlayerTarget {
   mediaType: MediaType;
   id: string;
@@ -123,7 +136,7 @@ export interface PlayerTarget {
   poster: string;
   banner: string;
   streamUrl?: string;
-  streamFormat?: 'hls' | 'mp4' | 'ts';
+  streamFormat?: 'hls' | 'mp4' | 'mkv' | 'ts' | 'unsupported';
   isDemo?: boolean;
   seriesId?: string;
   episodeId?: string;

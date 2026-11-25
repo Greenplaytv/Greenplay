@@ -14,9 +14,10 @@ import type {
 
 interface HomePageProps {
   catalog: HomeCatalogResponse | null;
-  loading: boolean;
-  error: string | null;
-  onRetry: () => void;
+  sectionLoading: Record<MediaType, boolean>;
+  sectionErrors: Record<MediaType, string | null>;
+  onRetrySection: (type: MediaType) => void;
+  onRetryAll: () => void;
   favorites: MediaItem[];
   history: ContinueWatchingEntry[];
   onPlayItem: (item: MediaItem) => void;
@@ -28,9 +29,10 @@ interface HomePageProps {
 
 export const HomePage: React.FC<HomePageProps> = ({
   catalog,
-  loading,
-  error,
-  onRetry,
+  sectionLoading,
+  sectionErrors,
+  onRetrySection,
+  onRetryAll,
   favorites,
   history,
   onPlayItem,
@@ -39,7 +41,13 @@ export const HomePage: React.FC<HomePageProps> = ({
   onNavigateCatalog,
   onNavigateMyList,
 }) => {
-  if (loading && !catalog) {
+  const anyLoading = sectionLoading.movie || sectionLoading.series || sectionLoading.live;
+  const allErrored =
+    !anyLoading &&
+    !catalog &&
+    Boolean(sectionErrors.movie || sectionErrors.series || sectionErrors.live);
+
+  if (anyLoading && !catalog) {
     return (
       <div>
         <HeroSkeleton />
@@ -51,17 +59,19 @@ export const HomePage: React.FC<HomePageProps> = ({
     );
   }
 
-  if (error && !catalog) {
+  if (allErrored) {
     return (
       <div className="max-w-lg mx-auto px-4 py-24 text-center">
         <AlertCircle className="h-10 w-10 text-red-400 mx-auto mb-3" />
         <h2 className="font-display text-xl font-semibold text-white">
           Não foi possível carregar o catálogo inicial
         </h2>
-        <p className="mt-2 text-sm text-[#9CA8A2]">{error}</p>
+        <p className="mt-2 text-sm text-[#9CA8A2]">
+          {sectionErrors.movie || sectionErrors.series || sectionErrors.live}
+        </p>
         <button
           type="button"
-          onClick={onRetry}
+          onClick={onRetryAll}
           className="mt-6 min-h-[44px] inline-flex items-center gap-2 px-5 py-2.5 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-[#04120B] font-semibold text-sm cursor-pointer"
         >
           <RotateCcw className="h-4 w-4" />
@@ -86,12 +96,14 @@ export const HomePage: React.FC<HomePageProps> = ({
 
   return (
     <div className="pb-16">
-      {catalog.featured && (
+      {catalog.featured ? (
         <HeroBanner
           item={catalog.featured}
           onPlay={onPlayItem}
           onMoreInfo={onOpenDetail}
         />
+      ) : (
+        anyLoading && <HeroSkeleton />
       )}
 
       <div className="max-w-[1440px] mx-auto px-4 sm:px-8 lg:px-12 pt-8 sm:pt-10 space-y-10 sm:space-y-12">
@@ -149,39 +161,73 @@ export const HomePage: React.FC<HomePageProps> = ({
         )}
 
         {/* Filmes populares */}
-        {catalog.popularMovies.length > 0 && (
-          <HorizontalCarousel
-            title="Filmes populares"
-            actionLabel="Ver todos"
-            onAction={() => onNavigateCatalog('movie')}
-          >
-            {catalog.popularMovies.map((item) => (
-              <div
-                key={`mov-${item.id}`}
-                className="w-[146px] sm:w-[172px] md:w-[190px] shrink-0 snap-start"
-              >
-                <MediaCard item={item} onSelect={onOpenDetail} />
-              </div>
-            ))}
-          </HorizontalCarousel>
+        {sectionLoading.movie && catalog.popularMovies.length === 0 ? (
+          <RowSkeleton />
+        ) : sectionErrors.movie && catalog.popularMovies.length === 0 ? (
+          <section className="rounded-xl border border-white/[0.08] bg-[#0D1210] p-4 flex items-center justify-between gap-4">
+            <p className="text-sm text-[#9CA8A2]">
+              Não foi possível carregar filmes: {sectionErrors.movie}
+            </p>
+            <button
+              type="button"
+              onClick={() => onRetrySection('movie')}
+              className="min-h-[38px] px-4 rounded-lg bg-emerald-500/15 hover:bg-emerald-500/25 text-emerald-300 text-xs font-semibold shrink-0 cursor-pointer"
+            >
+              Tentar novamente
+            </button>
+          </section>
+        ) : (
+          catalog.popularMovies.length > 0 && (
+            <HorizontalCarousel
+              title="Filmes populares"
+              actionLabel="Ver todos"
+              onAction={() => onNavigateCatalog('movie')}
+            >
+              {catalog.popularMovies.map((item) => (
+                <div
+                  key={`mov-${item.id}`}
+                  className="w-[146px] sm:w-[172px] md:w-[190px] shrink-0 snap-start"
+                >
+                  <MediaCard item={item} onSelect={onOpenDetail} />
+                </div>
+              ))}
+            </HorizontalCarousel>
+          )
         )}
 
         {/* Séries populares */}
-        {catalog.popularSeries.length > 0 && (
-          <HorizontalCarousel
-            title="Séries populares"
-            actionLabel="Ver todas"
-            onAction={() => onNavigateCatalog('series')}
-          >
-            {catalog.popularSeries.map((item) => (
-              <div
-                key={`ser-${item.id}`}
-                className="w-[146px] sm:w-[172px] md:w-[190px] shrink-0 snap-start"
-              >
-                <MediaCard item={item} onSelect={onOpenDetail} />
-              </div>
-            ))}
-          </HorizontalCarousel>
+        {sectionLoading.series && catalog.popularSeries.length === 0 ? (
+          <RowSkeleton />
+        ) : sectionErrors.series && catalog.popularSeries.length === 0 ? (
+          <section className="rounded-xl border border-white/[0.08] bg-[#0D1210] p-4 flex items-center justify-between gap-4">
+            <p className="text-sm text-[#9CA8A2]">
+              Não foi possível carregar séries: {sectionErrors.series}
+            </p>
+            <button
+              type="button"
+              onClick={() => onRetrySection('series')}
+              className="min-h-[38px] px-4 rounded-lg bg-emerald-500/15 hover:bg-emerald-500/25 text-emerald-300 text-xs font-semibold shrink-0 cursor-pointer"
+            >
+              Tentar novamente
+            </button>
+          </section>
+        ) : (
+          catalog.popularSeries.length > 0 && (
+            <HorizontalCarousel
+              title="Séries populares"
+              actionLabel="Ver todas"
+              onAction={() => onNavigateCatalog('series')}
+            >
+              {catalog.popularSeries.map((item) => (
+                <div
+                  key={`ser-${item.id}`}
+                  className="w-[146px] sm:w-[172px] md:w-[190px] shrink-0 snap-start"
+                >
+                  <MediaCard item={item} onSelect={onOpenDetail} />
+                </div>
+              ))}
+            </HorizontalCarousel>
+          )
         )}
 
         {/* Adicionados recentemente */}
@@ -224,26 +270,43 @@ export const HomePage: React.FC<HomePageProps> = ({
         )}
 
         {/* TV ao vivo */}
-        {catalog.liveChannels.length > 0 && (
-          <HorizontalCarousel
-            title="TV ao vivo"
-            actionLabel="Ver canais"
-            onAction={() => onNavigateCatalog('live')}
-          >
-            {catalog.liveChannels.map((ch) => (
-              <div
-                key={`live-${ch.id}`}
-                className="w-[190px] sm:w-[230px] shrink-0 snap-start"
-              >
-                <MediaCard
-                  aspect="landscape"
-                  item={ch}
-                  subtitleOverride={`Ao vivo · ${ch.categoryName || 'Canal'}`}
-                  onSelect={() => onPlayItem(ch)}
-                />
-              </div>
-            ))}
-          </HorizontalCarousel>
+        {sectionLoading.live && catalog.liveChannels.length === 0 ? (
+          <RowSkeleton />
+        ) : sectionErrors.live && catalog.liveChannels.length === 0 ? (
+          <section className="rounded-xl border border-white/[0.08] bg-[#0D1210] p-4 flex items-center justify-between gap-4">
+            <p className="text-sm text-[#9CA8A2]">
+              Não foi possível carregar canais ao vivo: {sectionErrors.live}
+            </p>
+            <button
+              type="button"
+              onClick={() => onRetrySection('live')}
+              className="min-h-[38px] px-4 rounded-lg bg-emerald-500/15 hover:bg-emerald-500/25 text-emerald-300 text-xs font-semibold shrink-0 cursor-pointer"
+            >
+              Tentar novamente
+            </button>
+          </section>
+        ) : (
+          catalog.liveChannels.length > 0 && (
+            <HorizontalCarousel
+              title="TV ao vivo"
+              actionLabel="Ver canais"
+              onAction={() => onNavigateCatalog('live')}
+            >
+              {catalog.liveChannels.map((ch) => (
+                <div
+                  key={`live-${ch.id}`}
+                  className="w-[190px] sm:w-[230px] shrink-0 snap-start"
+                >
+                  <MediaCard
+                    aspect="landscape"
+                    item={ch}
+                    subtitleOverride={`Ao vivo · ${ch.categoryName || 'Canal'}`}
+                    onSelect={() => onPlayItem(ch)}
+                  />
+                </div>
+              ))}
+            </HorizontalCarousel>
+          )
         )}
 
         {/* Categorias */}

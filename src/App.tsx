@@ -1,4 +1,4 @@
-import React, {useCallback, useEffect, useState} from 'react';
+import React, {useCallback, useEffect, useRef, useState} from 'react';
 import {AccountModal} from './components/AccountModal';
 import {Header, type AppRoute} from './components/Header';
 import {OfflineIndicator} from './components/OfflineIndicator';
@@ -13,8 +13,9 @@ import {LoginPage} from './pages/LoginPage';
 import {MyListPage} from './pages/MyListPage';
 import {SearchPage} from './pages/SearchPage';
 import {
-  fetchHomeCatalog,
+  fetchHomeSection,
   fetchItemDetail,
+  fetchPlaybackSource,
   logoutIptv,
 } from './services/iptvApi';
 import type {
@@ -46,8 +47,17 @@ export default function App() {
   const [previousRoute, setPreviousRoute] = useState<AppRoute>('home');
 
   const [homeCatalog, setHomeCatalog] = useState<HomeCatalogResponse | null>(null);
-  const [homeLoading, setHomeLoading] = useState(false);
-  const [homeError, setHomeError] = useState<string | null>(null);
+  const [sectionLoading, setSectionLoading] = useState<Record<MediaType, boolean>>({
+    movie: false,
+    series: false,
+    live: false,
+  });
+  const [sectionErrors, setSectionErrors] = useState<Record<MediaType, string | null>>({
+    movie: null,
+    series: null,
+    live: null,
+  });
+  const loadedScopeRef = useRef<string | null>(null);
 
   const [playerTarget, setPlayerTarget] = useState<PlayerTarget | null>(null);
   const [showAccountModal, setShowAccountModal] = useState(false);
@@ -68,29 +78,92 @@ export default function App() {
 
   const isDemoMode = !session || session.mode === 'demo';
 
-  const loadHome = useCallback(async (activeSession: AuthSessionInfo) => {
-    if (activeSession.mode === 'demo') {
-      setHomeCatalog(getDemoHomeCatalog());
-      setHomeError(null);
-      setHomeLoading(false);
-      return;
-    }
+  const loadSingleSection = useCallback(
+    async (type: MediaType, activeScope: string) => {
+      setSectionLoading((prev) => ({...prev, [type]: true}));
+      setSectionErrors((prev) => ({...prev, [type]: null}));
+      try {
+        const res = await fetchHomeSection(type);
+        if (loadedScopeRef.current !== activeScope) return;
+        setHomeCatalog((prev) => {
+          const base: HomeCatalogResponse = prev || {
+            featured: null,
+            liveChannels: [],
+            popularMovies: [],
+            popularSeries: [],
+            recentlyAdded: [],
+            categories: {movies: [], series: [], live: []},
+          };
+          const nextMovies = type === 'movie' ? res.items : base.popularMovies;
+          const nextSeries = type === 'series' ? res.items : base.popularSeries;
+          const nextLive = type === 'live' ? res.items : base.liveChannels;
+          const nextFeatured =
+            base.featured || nextMovies[0] || nextSeries[0] || nextLive[0] || null;
+          const nextRecent =
+            type === 'live'
+              ? base.recentlyAdded
+              : [
+                  ...(type === 'movie' ? res.recentlyAdded.slice(0, 8) : base.popularMovies.slice(-8).reverse()),
+                  ...(type === 'series' ? res.recentlyAdded.slice(0, 8) : base.popularSeries.slice(-8).reverse()),
+                ].slice(0, 16);
 
-    setHomeLoading(true);
-    setHomeError(null);
-    try {
-      const data = await fetchHomeCatalog();
-      setHomeCatalog(data);
-    } catch (err) {
-      setHomeError(
-        err instanceof Error
-          ? err.message
-          : 'Erro ao carregar o catálogo inicial.',
-      );
-    } finally {
-      setHomeLoading(false);
-    }
-  }, []);
+          return {
+            featured: nextFeatured,
+            popularMovies: nextMovies,
+            popularSeries: nextSeries,
+            liveChannels: nextLive,
+            recentlyAdded: nextRecent,
+            categories: {
+              movies: type === 'movie' ? res.categories : base.categories.movies,
+              series: type === 'series' ? res.categories : base.categories.series,
+              live: type === 'live' ? res.categories : base.categories.live,
+            },
+          };
+        });
+      } catch (err) {
+        if (loadedScopeRef.current !== activeScope) return;
+        setSectionErrors((prev) => ({
+          ...prev,
+          [type]:
+            err instanceof Error
+              ? err.message
+              : 'Erro ao carregar esta seção.',
+        }));
+      } finally {
+        if (loadedScopeRef.current === activeScope) {
+          setSectionLoading((prev) => ({...prev, [type]: false}));
+        }
+      }
+    },
+    [],
+  );
+
+  const loadHome = useCallback(
+    (activeSession: AuthSessionInfo, force = false) => {
+      const scope = activeSession.authenticated
+        ? `${activeSession.mode}:${activeSession.serverHost || ''}:${activeSession.accountLabel}`
+        : 'demo';
+
+      if (!force && loadedScopeRef.current === scope) {
+        return;
+      }
+      loadedScopeRef.current = scope;
+
+      if (activeSession.mode === 'demo') {
+        setHomeCatalog(getDemoHomeCatalog());
+        setSectionLoading({movie: false, series: false, live: false});
+        setSectionErrors({movie: null, series: null, live: null});
+        return;
+      }
+
+      setHomeCatalog(null);
+      // Load movies, series, and live independently so the first ready data renders immediately
+      void loadSingleSection('movie', scope);
+      void loadSingleSection('series', scope);
+      void loadSingleSection('live', scope);
+    },
+    [loadSingleSection],
+  );
 
   useEffect(() => {
     if (session) {
@@ -295,8 +368,11 @@ export default function App() {
 
   const handleDisconnect = async () => {
     await logoutIptv();
+    loadedScopeRef.current = null;
     setSession(null);
     setHomeCatalog(null);
+    setSectionLoading({movie: false, series: false, live: false});
+    setSectionErrors({movie: null, series: null, live: null});
     setPlayerTarget(null);
     setRoute('home');
   };
@@ -307,10 +383,12 @@ export default function App() {
       <>
         <LoginPage
           onAuthenticated={(authSession) => {
+            loadedScopeRef.current = null;
             setSession(authSession);
             setRoute('home');
           }}
           onEnterDemo={() => {
+            loadedScopeRef.current = null;
             setSession(DEMO_SESSION);
             setRoute('home');
           }}
@@ -333,9 +411,10 @@ export default function App() {
         {route === 'home' && (
           <HomePage
             catalog={homeCatalog}
-            loading={homeLoading}
-            error={homeError}
-            onRetry={() => loadHome(session)}
+            sectionLoading={sectionLoading}
+            sectionErrors={sectionErrors}
+            onRetrySection={(type) => loadSingleSection(type, accountScope)}
+            onRetryAll={() => loadHome(session, true)}
             favorites={favorites}
             history={history}
             onPlayItem={(item) => handlePlayItem(item)}
@@ -437,6 +516,9 @@ export default function App() {
       {playerTarget && (
         <VideoPlayerModal
           target={playerTarget}
+          resolvePlaybackSource={
+            isDemoMode ? undefined : (type, id) => fetchPlaybackSource(type, id)
+          }
           onClose={() => setPlayerTarget(null)}
           onProgress={handlePlayerProgress}
           onConnectIptv={handleDisconnect}

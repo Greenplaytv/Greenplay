@@ -4,9 +4,11 @@ import type {
   EpisodeItem,
   GlobalSearchResponse,
   HomeCatalogResponse,
+  HomeSectionResponse,
   MediaItem,
   MediaType,
   PaginatedCatalogResponse,
+  PlaybackSourceResponse,
   SeasonGroup,
   SeriesDetail,
 } from '../types/catalog';
@@ -31,15 +33,35 @@ interface StreamTokenPayload {
   exp: number;
 }
 
-interface CachedTypeCatalog {
+type StreamFormatType = 'hls' | 'mp4' | 'mkv' | 'ts' | 'unsupported';
+
+interface RawCatalogItem {
+  id: string;
+  type: MediaType;
+  title: string;
+  description: string;
+  rawPoster: string;
+  rawBanner: string;
+  genres: string[];
+  categoryId: string;
+  categoryName: string;
+  year?: string;
+  rating?: string;
+  channelNumber?: number;
+  containerExt?: string;
+  rawStreamUrl?: string;
+}
+
+interface RawTypeCatalog {
   categories: CategoryItem[];
-  items: MediaItem[];
+  items: RawCatalogItem[];
   fetchedAt: number;
 }
 
 const SESSION_TTL_SEC = 12 * 60 * 60; // 12 hours
 const STREAM_TOKEN_TTL_SEC = 4 * 60 * 60; // 4 hours
 const CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+const XTREAM_TIMEOUT_MS = 25000; // 25 seconds for larger provider responses
 const MAX_M3U_BYTES = 25 * 1024 * 1024; // 25MB cap
 
 const textEncoder = new TextEncoder();
@@ -48,6 +70,7 @@ const textDecoder = new TextDecoder();
 // Ephemeral fallback secret per isolate if SESSION_SECRET env var is not yet configured
 let isolateFallbackSecretBytes: Uint8Array | null = null;
 const memoryCatalogCache = new Map<string, {data: unknown; expiresAt: number}>();
+const inflightRequests = new Map<string, Promise<unknown>>();
 
 function getFallbackSecretBytes(): Uint8Array {
   if (!isolateFallbackSecretBytes) {
@@ -367,15 +390,54 @@ async function safeFetch(
   throw new Error('Muitos redirecionamentos no servidor IPTV.');
 }
 
-// --- Signed Stream & Image URLs ---
+// --- Stream Format, URL Redaction & Image Proxy Helpers ---
 
-async function createStreamProxyUrl(upstreamUrl: string, env: WorkerEnv): Promise<string> {
-  const payload: StreamTokenPayload = {
-    url: upstreamUrl,
-    exp: Math.floor(Date.now() / 1000) + STREAM_TOKEN_TTL_SEC,
-  };
-  const signed = await encryptToken(payload, env);
-  return `/api/iptv/stream?st=${encodeURIComponent(signed)}`;
+function redactUrlForLog(rawUrl: string): string {
+  try {
+    const parsed = new URL(rawUrl);
+    parsed.username = '';
+    parsed.password = '';
+    const segments = parsed.pathname.split('/');
+    if (
+      segments.length >= 5 &&
+      (segments[1] === 'live' || segments[1] === 'movie' || segments[1] === 'series')
+    ) {
+      segments[2] = '***';
+      segments[3] = '***';
+      parsed.pathname = segments.join('/');
+    }
+    for (const key of ['username', 'password', 'user', 'pass', 'token', 'st']) {
+      if (parsed.searchParams.has(key)) {
+        parsed.searchParams.set(key, '***');
+      }
+    }
+    return parsed.toString();
+  } catch {
+    return '[url-redacted]';
+  }
+}
+
+function detectStreamFormat(extOrUrl: string): StreamFormatType {
+  const clean = extOrUrl.split('?')[0].split('#')[0].trim().toLowerCase();
+  const extMatch = clean.match(/\.([a-z0-9]+)$/);
+  const ext = extMatch ? extMatch[1] : clean.replace(/[^a-z0-9]/g, '');
+
+  if (ext === 'm3u8' || clean.includes('.m3u8')) return 'hls';
+  if (ext === 'mp4' || ext === 'm4v' || ext === 'mov' || ext === 'webm') return 'mp4';
+  if (ext === 'mkv') return 'mkv';
+  if (ext === 'ts') return 'ts';
+  if (
+    ext === 'avi' ||
+    ext === 'flv' ||
+    ext === 'wmv' ||
+    ext === 'mpg' ||
+    ext === 'mpeg' ||
+    ext === 'vob' ||
+    ext === 'divx'
+  ) {
+    return 'unsupported';
+  }
+  return 'mp4';
 }
 
 async function createImageProxyUrl(imageUrl: string, env: WorkerEnv): Promise<string> {
@@ -393,6 +455,61 @@ async function createImageProxyUrl(imageUrl: string, env: WorkerEnv): Promise<st
   };
   const signed = await encryptToken(payload, env);
   return `/api/iptv/image?st=${encodeURIComponent(signed)}`;
+}
+
+async function materializeMediaItem(
+  raw: RawCatalogItem,
+  env: WorkerEnv,
+  includeDirectStream = false,
+): Promise<MediaItem> {
+  const poster = await createImageProxyUrl(raw.rawPoster, env);
+  const banner = raw.rawBanner
+    ? (await createImageProxyUrl(raw.rawBanner, env)) || poster
+    : poster;
+
+  const item: MediaItem = {
+    id: raw.id,
+    type: raw.type,
+    title: raw.title,
+    description: raw.description,
+    poster,
+    banner,
+    genres: raw.genres.length ? raw.genres : [raw.categoryName || 'Catálogo'],
+    categoryId: raw.categoryId,
+    categoryName: raw.categoryName,
+    year: raw.year,
+    rating: raw.rating,
+    channelNumber: raw.channelNumber,
+  };
+
+  if (includeDirectStream && raw.rawStreamUrl) {
+    item.streamUrl = raw.rawStreamUrl;
+    item.streamFormat = detectStreamFormat(raw.rawStreamUrl);
+  } else if (raw.containerExt) {
+    item.streamFormat = detectStreamFormat(raw.containerExt);
+  }
+
+  return item;
+}
+
+async function materializeMediaItems(
+  rawItems: RawCatalogItem[],
+  env: WorkerEnv,
+  includeDirectStream = false,
+): Promise<MediaItem[]> {
+  return Promise.all(rawItems.map((raw) => materializeMediaItem(raw, env, includeDirectStream)));
+}
+
+function deduplicateTask<T>(key: string, fn: () => Promise<T>): Promise<T> {
+  const existing = inflightRequests.get(key) as Promise<T> | undefined;
+  if (existing) {
+    return existing;
+  }
+  const promise = fn().finally(() => {
+    inflightRequests.delete(key);
+  });
+  inflightRequests.set(key, promise);
+  return promise;
 }
 
 // --- M3U Parser ---
@@ -433,15 +550,15 @@ function slugGroupId(type: MediaType, groupName: string): string {
   return `m3u-${type}-${encoded}`;
 }
 
-async function parseM3UPlaylist(content: string, env: WorkerEnv) {
+function parseM3UPlaylistRaw(content: string): Record<MediaType, RawTypeCatalog> {
   const lines = content.split(/\r?\n/);
   const liveCategoriesMap = new Map<string, CategoryItem>();
   const movieCategoriesMap = new Map<string, CategoryItem>();
   const seriesCategoriesMap = new Map<string, CategoryItem>();
 
-  const liveItems: MediaItem[] = [];
-  const movieItems: MediaItem[] = [];
-  const seriesItems: MediaItem[] = [];
+  const liveItems: RawCatalogItem[] = [];
+  const movieItems: RawCatalogItem[] = [];
+  const seriesItems: RawCatalogItem[] = [];
 
   let currentMeta: {
     name: string;
@@ -475,14 +592,8 @@ async function parseM3UPlaylist(content: string, env: WorkerEnv) {
       const type = inferM3UType(currentMeta.group, line, currentMeta.name);
       const catId = slugGroupId(type, currentMeta.group);
       const itemId = `m3u-${index}`;
-      const poster = await createImageProxyUrl(currentMeta.logo, env);
-      const format: 'hls' | 'mp4' | 'ts' = /\.m3u8(\?|$)/i.test(line)
-        ? 'hls'
-        : /\.(mp4|mkv|webm)(\?|$)/i.test(line)
-          ? 'mp4'
-          : 'ts';
 
-      const mediaItem: MediaItem = {
+      const rawItem: RawCatalogItem = {
         id: itemId,
         type,
         title: currentMeta.name,
@@ -490,40 +601,40 @@ async function parseM3UPlaylist(content: string, env: WorkerEnv) {
           type === 'live'
             ? `Transmissão ao vivo na categoria ${currentMeta.group}.`
             : `Conteúdo da lista conectada na categoria ${currentMeta.group}.`,
-        poster,
-        banner: poster,
+        rawPoster: currentMeta.logo,
+        rawBanner: currentMeta.logo,
         genres: [currentMeta.group],
         categoryId: catId,
         categoryName: currentMeta.group,
         channelNumber: type === 'live' ? liveItems.length + 1 : undefined,
-        streamUrl: await createStreamProxyUrl(line, env),
-        streamFormat: format,
+        rawStreamUrl: line,
       };
 
       if (type === 'live') {
         if (!liveCategoriesMap.has(catId)) {
           liveCategoriesMap.set(catId, {id: catId, name: currentMeta.group, type: 'live'});
         }
-        liveItems.push(mediaItem);
+        liveItems.push(rawItem);
       } else if (type === 'movie') {
         if (!movieCategoriesMap.has(catId)) {
           movieCategoriesMap.set(catId, {id: catId, name: currentMeta.group, type: 'movie'});
         }
-        movieItems.push(mediaItem);
+        movieItems.push(rawItem);
       } else {
         if (!seriesCategoriesMap.has(catId)) {
           seriesCategoriesMap.set(catId, {id: catId, name: currentMeta.group, type: 'series'});
         }
-        seriesItems.push(mediaItem);
+        seriesItems.push(rawItem);
       }
       currentMeta = null;
     }
   }
 
+  const now = Date.now();
   return {
-    live: {categories: [...liveCategoriesMap.values()], items: liveItems, fetchedAt: Date.now()},
-    movie: {categories: [...movieCategoriesMap.values()], items: movieItems, fetchedAt: Date.now()},
-    series: {categories: [...seriesCategoriesMap.values()], items: seriesItems, fetchedAt: Date.now()},
+    live: {categories: [...liveCategoriesMap.values()], items: liveItems, fetchedAt: now},
+    movie: {categories: [...movieCategoriesMap.values()], items: movieItems, fetchedAt: now},
+    series: {categories: [...seriesCategoriesMap.values()], items: seriesItems, fetchedAt: now},
   };
 }
 
@@ -577,6 +688,7 @@ async function xtreamCall<T>(
   if (!session.serverUrl || !session.username || !session.password) {
     throw new Error('Sessão Xtream Codes inválida.');
   }
+  const startedAt = Date.now();
   const url = new URL(`${session.serverUrl}/player_api.php`);
   url.searchParams.set('username', session.username);
   url.searchParams.set('password', session.password);
@@ -584,11 +696,24 @@ async function xtreamCall<T>(
   for (const [k, v] of Object.entries(extraParams)) {
     url.searchParams.set(k, v);
   }
-  const res = await safeFetch(url.toString(), {timeoutMs: 18000});
+  const res = await safeFetch(url.toString(), {timeoutMs: XTREAM_TIMEOUT_MS});
+  const durationMs = Date.now() - startedAt;
   if (!res.ok) {
-    throw new Error(`O servidor IPTV respondeu com erro (${res.status}).`);
+    console.warn('[GreenPlay API] xtream error', {
+      action,
+      categoryId: extraParams.category_id || 'all',
+      status: res.status,
+      durationMs,
+    });
+    throw new Error(`O servidor IPTV respondeu com erro (HTTP ${res.status}).`);
   }
-  return (await res.json()) as T;
+  const json = (await res.json()) as T;
+  console.info('[GreenPlay API] xtream', {
+    action,
+    categoryId: extraParams.category_id || 'all',
+    durationMs,
+  });
+  return json;
 }
 
 async function getSessionScopeHash(session: SessionTokenPayload): Promise<string> {
@@ -599,129 +724,398 @@ async function getSessionScopeHash(session: SessionTokenPayload): Promise<string
   return sha256Hex(identity);
 }
 
-async function loadCatalogForType(
+function mapXtreamRawList(
+  rawList: Array<Record<string, unknown>>,
+  type: MediaType,
+  catNameById: Map<string, string>,
+): RawCatalogItem[] {
+  return rawList.map((raw, idx) => {
+    const id = String(
+      type === 'series' ? (raw.series_id ?? raw.id ?? idx) : (raw.stream_id ?? raw.id ?? idx),
+    );
+    const categoryId = String(raw.category_id ?? '');
+    const categoryName = catNameById.get(categoryId) || 'Catálogo';
+    const title = String(raw.name || raw.title || `Item ${idx + 1}`).trim();
+    const rawPoster = String(raw.stream_icon || raw.cover || '').trim();
+    const backdropList = Array.isArray(raw.backdrop_path) ? raw.backdrop_path : [];
+    const rawBanner = backdropList[0] ? String(backdropList[0]).trim() : rawPoster;
+    const genres = raw.genre
+      ? String(raw.genre)
+          .split(/[,/|]/)
+          .map((g) => g.trim())
+          .filter(Boolean)
+      : [categoryName];
+    const year = extractYear(raw.releaseDate || raw.year || raw.added || title);
+    const ratingVal = raw.rating ? String(raw.rating).trim() : undefined;
+    const containerExt =
+      type === 'live'
+        ? 'm3u8'
+        : raw.container_extension
+          ? String(raw.container_extension).toLowerCase().replace(/[^a-z0-9]/g, '')
+          : undefined;
+
+    return {
+      id,
+      type,
+      title,
+      description: String(raw.plot || raw.description || '').trim(),
+      rawPoster,
+      rawBanner,
+      genres: genres.length ? genres : [categoryName],
+      categoryId,
+      categoryName,
+      year,
+      rating: ratingVal && ratingVal !== '0' ? ratingVal : undefined,
+      channelNumber: type === 'live' ? Number(raw.num || idx + 1) : undefined,
+      containerExt,
+    };
+  });
+}
+
+async function ensureM3UCatalog(
   session: SessionTokenPayload,
   type: MediaType,
-  env: WorkerEnv,
-): Promise<CachedTypeCatalog> {
+): Promise<RawTypeCatalog> {
   const scopeHash = await getSessionScopeHash(session);
-  const cacheKey = `cat-${scopeHash}-${type}`;
-  const cached = await getCachedJson<CachedTypeCatalog>(cacheKey);
-  if (cached) {
-    return cached;
-  }
+  const cacheKey = `m3u-${scopeHash}-${type}`;
+  const cached = await getCachedJson<RawTypeCatalog>(cacheKey);
+  if (cached) return cached;
 
-  if (session.mode === 'm3u') {
+  return deduplicateTask(`task-m3u-${scopeHash}`, async () => {
+    const again = await getCachedJson<RawTypeCatalog>(cacheKey);
+    if (again) return again;
+
     if (!session.m3uUrl) {
       return {categories: [], items: [], fetchedAt: Date.now()};
     }
-    const res = await safeFetch(session.m3uUrl, {timeoutMs: 20000});
+    const startedAt = Date.now();
+    const res = await safeFetch(session.m3uUrl, {timeoutMs: 25000});
     if (!res.ok) {
       throw new Error(`Não foi possível acessar a lista M3U (HTTP ${res.status}).`);
     }
     const text = await res.text();
-    const parsed = await parseM3UPlaylist(text, env);
+    const parsed = parseM3UPlaylistRaw(text);
+    console.info('[GreenPlay API] m3u', {
+      durationMs: Date.now() - startedAt,
+      live: parsed.live.items.length,
+      movie: parsed.movie.items.length,
+      series: parsed.series.items.length,
+    });
     await Promise.all([
-      setCachedJson(`cat-${scopeHash}-live`, parsed.live),
-      setCachedJson(`cat-${scopeHash}-movie`, parsed.movie),
-      setCachedJson(`cat-${scopeHash}-series`, parsed.series),
+      setCachedJson(`m3u-${scopeHash}-live`, parsed.live),
+      setCachedJson(`m3u-${scopeHash}-movie`, parsed.movie),
+      setCachedJson(`m3u-${scopeHash}-series`, parsed.series),
     ]);
     return parsed[type];
+  });
+}
+
+async function loadCategoriesForType(
+  session: SessionTokenPayload,
+  type: MediaType,
+): Promise<CategoryItem[]> {
+  if (session.mode === 'm3u') {
+    const m3u = await ensureM3UCatalog(session, type);
+    return m3u.categories;
   }
 
-  const catAction =
-    type === 'live'
-      ? 'get_live_categories'
-      : type === 'movie'
-        ? 'get_vod_categories'
-        : 'get_series_categories';
+  const scopeHash = await getSessionScopeHash(session);
+  const cacheKey = `cats-${scopeHash}-${type}`;
+  const cached = await getCachedJson<CategoryItem[]>(cacheKey);
+  if (cached) return cached;
 
-  const streamAction =
-    type === 'live'
-      ? 'get_live_streams'
-      : type === 'movie'
-        ? 'get_vod_streams'
-        : 'get_series';
+  return deduplicateTask(cacheKey, async () => {
+    const again = await getCachedJson<CategoryItem[]>(cacheKey);
+    if (again) return again;
 
-  const [rawCats, rawItems] = await Promise.all([
-    xtreamCall<Array<{category_id: string | number; category_name: string}>>(session, catAction).catch(
-      () => [],
-    ),
-    xtreamCall<Array<Record<string, unknown>>>(session, streamAction).catch(() => []),
+    const catAction =
+      type === 'live'
+        ? 'get_live_categories'
+        : type === 'movie'
+          ? 'get_vod_categories'
+          : 'get_series_categories';
+
+    const rawCats = await xtreamCall<Array<{category_id: string | number; category_name: string}>>(
+      session,
+      catAction,
+    );
+
+    const categories: CategoryItem[] = Array.isArray(rawCats)
+      ? rawCats.map((c) => ({
+          id: String(c.category_id),
+          name: String(c.category_name || 'Sem categoria').trim(),
+          type,
+        }))
+      : [];
+
+    await setCachedJson(cacheKey, categories);
+    return categories;
+  });
+}
+
+async function loadCategoryItems(
+  session: SessionTokenPayload,
+  type: MediaType,
+  categoryId: string,
+  categories: CategoryItem[],
+): Promise<RawCatalogItem[]> {
+  if (session.mode === 'm3u') {
+    const m3u = await ensureM3UCatalog(session, type);
+    return categoryId === 'all'
+      ? m3u.items
+      : m3u.items.filter((i) => i.categoryId === categoryId);
+  }
+
+  const scopeHash = await getSessionScopeHash(session);
+  const cacheKey = `catitems-${scopeHash}-${type}-${categoryId}`;
+  const cached = await getCachedJson<RawCatalogItem[]>(cacheKey);
+  if (cached) return cached;
+
+  return deduplicateTask(cacheKey, async () => {
+    const again = await getCachedJson<RawCatalogItem[]>(cacheKey);
+    if (again) return again;
+
+    const streamAction =
+      type === 'live'
+        ? 'get_live_streams'
+        : type === 'movie'
+          ? 'get_vod_streams'
+          : 'get_series';
+
+    const catNameById = new Map(categories.map((c) => [c.id, c.name]));
+    const rawItems = await xtreamCall<Array<Record<string, unknown>>>(session, streamAction, {
+      category_id: categoryId,
+    });
+    const rawList = Array.isArray(rawItems) ? rawItems : [];
+    const mapped = mapXtreamRawList(rawList, type, catNameById);
+    await setCachedJson(cacheKey, mapped);
+    return mapped;
+  });
+}
+
+async function loadAllRawItemsForType(
+  session: SessionTokenPayload,
+  type: MediaType,
+): Promise<RawTypeCatalog> {
+  if (session.mode === 'm3u') {
+    return ensureM3UCatalog(session, type);
+  }
+
+  const scopeHash = await getSessionScopeHash(session);
+  const cacheKey = `allitems-${scopeHash}-${type}`;
+  const cached = await getCachedJson<RawTypeCatalog>(cacheKey);
+  if (cached) return cached;
+
+  return deduplicateTask(cacheKey, async () => {
+    const again = await getCachedJson<RawTypeCatalog>(cacheKey);
+    if (again) return again;
+
+    const streamAction =
+      type === 'live'
+        ? 'get_live_streams'
+        : type === 'movie'
+          ? 'get_vod_streams'
+          : 'get_series';
+
+    const [categories, rawItems] = await Promise.all([
+      loadCategoriesForType(session, type).catch(() => [] as CategoryItem[]),
+      xtreamCall<Array<Record<string, unknown>>>(session, streamAction),
+    ]);
+
+    const catNameById = new Map(categories.map((c) => [c.id, c.name]));
+    const rawList = Array.isArray(rawItems) ? rawItems : [];
+    const items = mapXtreamRawList(rawList, type, catNameById);
+
+    const result: RawTypeCatalog = {categories, items, fetchedAt: Date.now()};
+    await setCachedJson(cacheKey, result);
+    return result;
+  });
+}
+
+async function buildHomeSectionData(
+  session: SessionTokenPayload,
+  type: MediaType,
+  env: WorkerEnv,
+): Promise<HomeSectionResponse> {
+  const startedAt = Date.now();
+  if (session.mode === 'm3u') {
+    const m3u = await ensureM3UCatalog(session, type);
+    const items = await materializeMediaItems(m3u.items.slice(0, 18), env);
+    const recentlyAdded =
+      type === 'live'
+        ? []
+        : await materializeMediaItems(m3u.items.slice(-8).reverse(), env);
+    return {
+      type,
+      categories: m3u.categories.slice(0, 24),
+      items,
+      recentlyAdded,
+    };
+  }
+
+  const scopeHash = await getSessionScopeHash(session);
+  const fullCached = await getCachedJson<RawTypeCatalog>(`allitems-${scopeHash}-${type}`);
+  if (fullCached) {
+    const items = await materializeMediaItems(fullCached.items.slice(0, 18), env);
+    const recentlyAdded =
+      type === 'live'
+        ? []
+        : await materializeMediaItems(fullCached.items.slice(-8).reverse(), env);
+    return {
+      type,
+      categories: fullCached.categories.slice(0, 24),
+      items,
+      recentlyAdded,
+    };
+  }
+
+  const categories = await loadCategoriesForType(session, type);
+  let collected: RawCatalogItem[] = [];
+
+  if (categories.length > 0) {
+    // Load only the first 1-3 categories so the home feed opens fast without pulling 30k items
+    const candidateCats = categories.slice(0, 3);
+    for (const cat of candidateCats) {
+      try {
+        const catItems = await loadCategoryItems(session, type, cat.id, categories);
+        if (catItems.length > 0) {
+          collected = collected.concat(catItems);
+        }
+        if (collected.length >= 24) break;
+      } catch {
+        // If one category fails, continue with remaining categories
+      }
+    }
+  } else {
+    const full = await loadAllRawItemsForType(session, type);
+    collected = full.items;
+  }
+
+  const [items, recentlyAdded] = await Promise.all([
+    materializeMediaItems(collected.slice(0, 18), env),
+    type === 'live'
+      ? Promise.resolve([] as MediaItem[])
+      : materializeMediaItems(collected.slice(-8).reverse(), env),
   ]);
 
-  const categories: CategoryItem[] = Array.isArray(rawCats)
-    ? rawCats.map((c) => ({
-        id: String(c.category_id),
-        name: String(c.category_name || 'Sem categoria').trim(),
-        type,
-      }))
-    : [];
+  console.info('[GreenPlay API] home-section', {
+    type,
+    categories: categories.length,
+    returned: items.length,
+    durationMs: Date.now() - startedAt,
+  });
 
-  const catNameById = new Map(categories.map((c) => [c.id, c.name]));
-
-  const rawList = Array.isArray(rawItems) ? rawItems : [];
-  const items: MediaItem[] = await Promise.all(
-    rawList.map(async (raw, idx) => {
-      const id = String(
-        type === 'series' ? (raw.series_id ?? raw.id ?? idx) : (raw.stream_id ?? raw.id ?? idx),
-      );
-      const categoryId = String(raw.category_id ?? '');
-      const categoryName = catNameById.get(categoryId) || 'Catálogo';
-      const title = String(raw.name || raw.title || `Item ${idx + 1}`).trim();
-      const rawCover = String(raw.stream_icon || raw.cover || '');
-      const poster = await createImageProxyUrl(rawCover, env);
-      const backdropList = Array.isArray(raw.backdrop_path) ? raw.backdrop_path : [];
-      const rawBanner = backdropList[0] ? String(backdropList[0]) : rawCover;
-      const banner = (await createImageProxyUrl(rawBanner, env)) || poster;
-      const genres = raw.genre
-        ? String(raw.genre)
-            .split(/[,/|]/)
-            .map((g) => g.trim())
-            .filter(Boolean)
-        : [categoryName];
-      const year = extractYear(raw.releaseDate || raw.year || raw.added || title);
-      const ratingVal = raw.rating ? String(raw.rating).trim() : undefined;
-
-      let streamUrl: string | undefined;
-      let streamFormat: 'hls' | 'mp4' | 'ts' | undefined;
-      if (type === 'live' && session.serverUrl && session.username && session.password) {
-        const upstream = `${session.serverUrl}/live/${encodeURIComponent(session.username)}/${encodeURIComponent(session.password)}/${encodeURIComponent(id)}.m3u8`;
-        streamUrl = await createStreamProxyUrl(upstream, env);
-        streamFormat = 'hls';
-      } else if (type === 'movie' && session.serverUrl && session.username && session.password) {
-        const ext = String(raw.container_extension || 'mp4').replace(/[^a-z0-9]/gi, '') || 'mp4';
-        const upstream = `${session.serverUrl}/movie/${encodeURIComponent(session.username)}/${encodeURIComponent(session.password)}/${encodeURIComponent(id)}.${ext}`;
-        streamUrl = await createStreamProxyUrl(upstream, env);
-        streamFormat = ext === 'm3u8' ? 'hls' : 'mp4';
-      }
-
-      return {
-        id,
-        type,
-        title,
-        description: String(raw.plot || raw.description || '').trim(),
-        poster,
-        banner,
-        genres: genres.length ? genres : [categoryName],
-        categoryId,
-        categoryName,
-        year,
-        rating: ratingVal && ratingVal !== '0' ? ratingVal : undefined,
-        channelNumber: type === 'live' ? Number(raw.num || idx + 1) : undefined,
-        streamUrl,
-        streamFormat,
-      };
-    }),
-  );
-
-  const result: CachedTypeCatalog = {
-    categories,
+  return {
+    type,
+    categories: categories.slice(0, 24),
     items,
-    fetchedAt: Date.now(),
+    recentlyAdded,
   };
-  await setCachedJson(cacheKey, result);
-  return result;
+}
+
+function buildDirectXtreamUrl(
+  session: SessionTokenPayload,
+  type: MediaType,
+  id: string,
+  ext?: string,
+): {streamUrl: string; streamFormat: StreamFormatType} {
+  const cleanUser = encodeURIComponent(session.username || '');
+  const cleanPass = encodeURIComponent(session.password || '');
+  const cleanId = encodeURIComponent(id);
+
+  if (type === 'live') {
+    const streamUrl = `${session.serverUrl}/live/${cleanUser}/${cleanPass}/${cleanId}.m3u8`;
+    return {streamUrl, streamFormat: 'hls'};
+  }
+
+  const normalizedExt =
+    (ext || 'mp4').toLowerCase().replace(/[^a-z0-9]/g, '') || 'mp4';
+  const segment = type === 'series' ? 'series' : 'movie';
+  const streamUrl = `${session.serverUrl}/${segment}/${cleanUser}/${cleanPass}/${cleanId}.${normalizedExt}`;
+  return {
+    streamUrl,
+    streamFormat: detectStreamFormat(normalizedExt),
+  };
+}
+
+async function resolvePlaybackSource(
+  session: SessionTokenPayload,
+  type: MediaType,
+  id: string,
+): Promise<PlaybackSourceResponse> {
+  if (session.mode === 'm3u') {
+    const catalog = await ensureM3UCatalog(session, type);
+    const found = catalog.items.find((item) => item.id === id);
+    if (!found?.rawStreamUrl) {
+      throw new Error('Fonte de reprodução não encontrada na lista M3U.');
+    }
+    const streamFormat = detectStreamFormat(found.rawStreamUrl);
+    console.info('[GreenPlay Playback]', {
+      mode: 'm3u',
+      type,
+      id,
+      format: streamFormat,
+      url: redactUrlForLog(found.rawStreamUrl),
+    });
+    return {streamUrl: found.rawStreamUrl, streamFormat};
+  }
+
+  if (!session.serverUrl || !session.username || !session.password) {
+    throw new Error('Sessão Xtream Codes inválida.');
+  }
+
+  if (type === 'live') {
+    const resolved = buildDirectXtreamUrl(session, 'live', id, 'm3u8');
+    console.info('[GreenPlay Playback]', {
+      mode: 'xtream',
+      type,
+      id,
+      format: resolved.streamFormat,
+      url: redactUrlForLog(resolved.streamUrl),
+    });
+    return resolved;
+  }
+
+  if (type === 'movie') {
+    let streamId = id;
+    let ext = 'mp4';
+    try {
+      const vodInfo = await xtreamCall<{movie_data?: Record<string, unknown>}>(
+        session,
+        'get_vod_info',
+        {vod_id: id},
+      );
+      if (vodInfo?.movie_data) {
+        if (vodInfo.movie_data.stream_id) {
+          streamId = String(vodInfo.movie_data.stream_id);
+        }
+        if (vodInfo.movie_data.container_extension) {
+          ext = String(vodInfo.movie_data.container_extension);
+        }
+      }
+    } catch {
+      // Fallback to default mp4 with requested id if get_vod_info is temporarily unavailable
+    }
+    const resolved = buildDirectXtreamUrl(session, 'movie', streamId, ext);
+    console.info('[GreenPlay Playback]', {
+      mode: 'xtream',
+      type,
+      id: streamId,
+      format: resolved.streamFormat,
+      url: redactUrlForLog(resolved.streamUrl),
+    });
+    return resolved;
+  }
+
+  const resolved = buildDirectXtreamUrl(session, 'series', id, 'mp4');
+  console.info('[GreenPlay Playback]', {
+    mode: 'xtream',
+    type,
+    id,
+    format: resolved.streamFormat,
+    url: redactUrlForLog(resolved.streamUrl),
+  });
+  return resolved;
 }
 
 // --- Response Helpers ---
@@ -975,7 +1369,7 @@ export async function handleApiRequest(request: Request, env: WorkerEnv): Promis
         );
       }
 
-      const parsedCatalog = await parseM3UPlaylist(text, env);
+      const parsedCatalog = parseM3UPlaylistRaw(text);
       const totalCount =
         parsedCatalog.live.items.length +
         parsedCatalog.movie.items.length +
@@ -1009,9 +1403,9 @@ export async function handleApiRequest(request: Request, env: WorkerEnv): Promis
       };
       const scopeHash = await getSessionScopeHash(tokenPayload);
       await Promise.all([
-        setCachedJson(`cat-${scopeHash}-live`, parsedCatalog.live),
-        setCachedJson(`cat-${scopeHash}-movie`, parsedCatalog.movie),
-        setCachedJson(`cat-${scopeHash}-series`, parsedCatalog.series),
+        setCachedJson(`m3u-${scopeHash}-live`, parsedCatalog.live),
+        setCachedJson(`m3u-${scopeHash}-movie`, parsedCatalog.movie),
+        setCachedJson(`m3u-${scopeHash}-series`, parsedCatalog.series),
       ]);
 
       const token = await encryptToken(tokenPayload, env);
@@ -1041,98 +1435,30 @@ export async function handleApiRequest(request: Request, env: WorkerEnv): Promis
           return jsonResponse({configured: true, error: 'Falha ao carregar playlist configurada.'}, 502);
         }
         const text = await upstreamRes.text();
-        const parsed = await parseM3UPlaylist(text, env);
+        const parsed = parseM3UPlaylistRaw(text);
+        const channels = await materializeMediaItems(parsed.live.items, env, true);
         return jsonResponse({
           configured: true,
           categories: parsed.live.categories,
-          channels: parsed.live.items,
+          channels,
         });
       } catch {
         return jsonResponse({configured: true, error: 'Erro ao conectar à playlist ao vivo.'}, 502);
       }
     }
 
-    // Stream proxy
+    // Direct playback avoids relaying full video streams through Cloudflare Workers
     if (pathname === '/api/iptv/stream' && method === 'GET') {
-      const st = url.searchParams.get('st') || '';
-      const payload = await decryptToken<StreamTokenPayload>(st, env);
-      if (!payload?.url) {
-        return jsonResponse({error: 'Token de reprodução inválido ou expirado.'}, 401);
-      }
-
-      const headers: Record<string, string> = {};
-      const rangeHeader = request.headers.get('range');
-      if (rangeHeader) {
-        headers.Range = rangeHeader;
-      }
-
-      const upstreamRes = await safeFetch(payload.url, {timeoutMs: 20000, headers});
-      if (!upstreamRes.ok && upstreamRes.status !== 206) {
-        return jsonResponse({error: 'Fonte de vídeo indisponível no provedor.'}, upstreamRes.status);
-      }
-
-      const contentType = upstreamRes.headers.get('content-type') || '';
-      const isHlsManifest =
-        contentType.includes('mpegurl') || payload.url.toLowerCase().includes('.m3u8');
-
-      if (isHlsManifest) {
-        const manifestText = await upstreamRes.text();
-        const baseUrl = upstreamRes.url || payload.url;
-        const lines = manifestText.split(/\r?\n/);
-        const rewrittenLines = await Promise.all(
-          lines.map(async (line) => {
-            const trimmed = line.trim();
-            if (!trimmed) return line;
-            if (trimmed.startsWith('#')) {
-              const matches = [...line.matchAll(/URI="([^"]+)"/g)];
-              if (matches.length === 0) return line;
-              let nextLine = line;
-              for (const m of matches) {
-                try {
-                  const abs = new URL(m[1], baseUrl).toString();
-                  const proxied = await createStreamProxyUrl(abs, env);
-                  nextLine = nextLine.replace(m[0], `URI="${proxied}"`);
-                } catch {
-                  // Keep original URI if unparseable
-                }
-              }
-              return nextLine;
-            }
-            try {
-              const abs = new URL(trimmed, baseUrl).toString();
-              return await createStreamProxyUrl(abs, env);
-            } catch {
-              return line;
-            }
-          }),
-        );
-
-        return new Response(rewrittenLines.join('\n'), {
-          status: 200,
-          headers: {
-            'Content-Type': 'application/vnd.apple.mpegurl; charset=utf-8',
-            'Cache-Control': 'no-store',
-          },
-        });
-      }
-
-      const responseHeaders = new Headers();
-      if (contentType) responseHeaders.set('Content-Type', contentType);
-      const contentLength = upstreamRes.headers.get('content-length');
-      if (contentLength) responseHeaders.set('Content-Length', contentLength);
-      const contentRange = upstreamRes.headers.get('content-range');
-      if (contentRange) responseHeaders.set('Content-Range', contentRange);
-      const acceptRanges = upstreamRes.headers.get('accept-ranges');
-      if (acceptRanges) responseHeaders.set('Accept-Ranges', acceptRanges);
-      responseHeaders.set('Cache-Control', 'no-store');
-
-      return new Response(upstreamRes.body, {
-        status: upstreamRes.status,
-        headers: responseHeaders,
-      });
+      return jsonResponse(
+        {
+          error:
+            'Retransmissão de vídeo via Worker desativada. Utilize a URL direta autorizada pelo provedor.',
+        },
+        410,
+      );
     }
 
-    // Image proxy for HTTP provider covers
+    // Image proxy for HTTP provider covers (small static thumbnails cached for 24h)
     if (pathname === '/api/iptv/image' && method === 'GET') {
       const st = url.searchParams.get('st') || '';
       const payload = await decryptToken<StreamTokenPayload>(st, env);
@@ -1169,53 +1495,77 @@ export async function handleApiRequest(request: Request, env: WorkerEnv): Promis
       );
     }
 
-    // Home feed
+    // Progressive single-type Home section (renders movies/series/live as soon as ready)
+    if (pathname === '/api/iptv/home-section' && method === 'GET') {
+      const rawType = url.searchParams.get('type') || 'movie';
+      if (rawType !== 'movie' && rawType !== 'series' && rawType !== 'live') {
+        return jsonResponse({error: 'Tipo de seção inválido.'}, 400);
+      }
+      const section = await buildHomeSectionData(session, rawType, env);
+      return jsonResponse(section);
+    }
+
+    // Combined Home feed (uses fast per-category loading under the hood)
     if (pathname === '/api/iptv/home' && method === 'GET') {
       const [moviesRes, seriesRes, liveRes] = await Promise.allSettled([
-        loadCatalogForType(session, 'movie', env),
-        loadCatalogForType(session, 'series', env),
-        loadCatalogForType(session, 'live', env),
+        buildHomeSectionData(session, 'movie', env),
+        buildHomeSectionData(session, 'series', env),
+        buildHomeSectionData(session, 'live', env),
       ]);
 
       const moviesCat =
-        moviesRes.status === 'fulfilled' ? moviesRes.value : {categories: [], items: []};
+        moviesRes.status === 'fulfilled'
+          ? moviesRes.value
+          : {type: 'movie' as const, categories: [], items: [], recentlyAdded: []};
       const seriesCat =
-        seriesRes.status === 'fulfilled' ? seriesRes.value : {categories: [], items: []};
+        seriesRes.status === 'fulfilled'
+          ? seriesRes.value
+          : {type: 'series' as const, categories: [], items: [], recentlyAdded: []};
       const liveCat =
-        liveRes.status === 'fulfilled' ? liveRes.value : {categories: [], items: []};
+        liveRes.status === 'fulfilled'
+          ? liveRes.value
+          : {type: 'live' as const, categories: [], items: [], recentlyAdded: []};
 
       const featured = moviesCat.items[0] || seriesCat.items[0] || liveCat.items[0] || null;
-      const popularMovies = moviesCat.items.slice(0, 18);
-      const popularSeries = seriesCat.items.slice(0, 18);
-      const liveChannels = liveCat.items.slice(0, 18);
       const recentlyAdded = [
-        ...moviesCat.items.slice(-8).reverse(),
-        ...seriesCat.items.slice(-8).reverse(),
+        ...moviesCat.recentlyAdded.slice(0, 8),
+        ...seriesCat.recentlyAdded.slice(0, 8),
       ].slice(0, 16);
 
       const response: HomeCatalogResponse = {
         featured,
-        liveChannels,
-        popularMovies,
-        popularSeries,
+        liveChannels: liveCat.items,
+        popularMovies: moviesCat.items,
+        popularSeries: seriesCat.items,
         recentlyAdded,
         categories: {
-          movies: moviesCat.categories.slice(0, 24),
-          series: seriesCat.categories.slice(0, 24),
-          live: liveCat.categories.slice(0, 24),
+          movies: moviesCat.categories,
+          series: seriesCat.categories,
+          live: liveCat.categories,
         },
       };
       return jsonResponse(response);
     }
 
-    // Paginated catalog
+    // On-demand Direct Playback Resolver (avoids exposing credentials in bulk catalogs)
+    if (pathname === '/api/iptv/play' && method === 'GET') {
+      const rawType = url.searchParams.get('type') || 'movie';
+      const id = (url.searchParams.get('id') || '').trim();
+      if ((rawType !== 'movie' && rawType !== 'series' && rawType !== 'live') || !id) {
+        return jsonResponse({error: 'Parâmetros de reprodução inválidos.'}, 400);
+      }
+      const resolved = await resolvePlaybackSource(session, rawType, id);
+      return jsonResponse(resolved);
+    }
+
+    // Paginated & Category-scoped Catalog
     if (pathname === '/api/iptv/catalog' && method === 'GET') {
+      const startedAt = Date.now();
       const rawType = url.searchParams.get('type') || 'movie';
       if (rawType !== 'movie' && rawType !== 'series' && rawType !== 'live') {
         return jsonResponse({error: 'Tipo de catálogo inválido.'}, 400);
       }
 
-      const catalog = await loadCatalogForType(session, rawType, env);
       const categoryId = url.searchParams.get('categoryId') || 'all';
       const q = (url.searchParams.get('q') || '').trim().toLowerCase();
       const genre = (url.searchParams.get('genre') || 'all').trim().toLowerCase();
@@ -1224,17 +1574,86 @@ export async function handleApiRequest(request: Request, env: WorkerEnv): Promis
       const page = Math.max(1, Number(url.searchParams.get('page')) || 1);
       const limit = Math.min(80, Math.max(12, Number(url.searchParams.get('limit')) || 36));
 
+      const categories = await loadCategoriesForType(session, rawType);
+      const scopeHash = await getSessionScopeHash(session);
+
+      let sourceItems: RawCatalogItem[] = [];
+      let hasMoreCategories = false;
+
+      if (session.mode === 'm3u') {
+        const full = await ensureM3UCatalog(session, rawType);
+        sourceItems =
+          categoryId === 'all'
+            ? full.items
+            : full.items.filter((i) => i.categoryId === categoryId);
+      } else if (categoryId !== 'all') {
+        // Fast single-category fetch via Xtream category_id
+        sourceItems = await loadCategoryItems(session, rawType, categoryId, categories);
+      } else {
+        const cachedFull = await getCachedJson<RawTypeCatalog>(`allitems-${scopeHash}-${rawType}`);
+        if (cachedFull) {
+          sourceItems = cachedFull.items;
+        } else if (!q && genre === 'all' && year === 'all' && sort === 'default' && categories.length > 0) {
+          // Progressive category-by-category loading: never fetch thousands of items on page 1
+          // Also cap uncached upstream category calls per Worker invocation to stay well below Cloudflare's subrequest limit
+          const targetNeeded = page * limit + 1;
+          const progCacheKey = `prog-${scopeHash}-${rawType}`;
+          const cachedProg = await getCachedJson<{nextCatIdx: number; items: RawCatalogItem[]}>(progCacheKey);
+          let catIdx = cachedProg ? cachedProg.nextCatIdx : 0;
+          sourceItems = cachedProg ? [...cachedProg.items] : [];
+          let uncachedFetches = 0;
+          const MAX_UNCACHED_FETCHES = 6;
+
+          while (
+            catIdx < categories.length &&
+            sourceItems.length < targetNeeded &&
+            uncachedFetches < MAX_UNCACHED_FETCHES
+          ) {
+            const batch = categories.slice(catIdx, catIdx + 2);
+            const results = await Promise.allSettled(
+              batch.map(async (c) => {
+                const catCacheKey = `catitems-${scopeHash}-${rawType}-${c.id}`;
+                const alreadyCached = await getCachedJson<RawCatalogItem[]>(catCacheKey);
+                if (!alreadyCached) {
+                  uncachedFetches += 1;
+                }
+                return loadCategoryItems(session, rawType, c.id, categories);
+              }),
+            );
+            for (const r of results) {
+              if (r.status === 'fulfilled' && r.value.length > 0) {
+                sourceItems = sourceItems.concat(r.value);
+              }
+            }
+            catIdx += batch.length;
+          }
+
+          if (catIdx > (cachedProg?.nextCatIdx || 0)) {
+            await setCachedJson(progCacheKey, {nextCatIdx: catIdx, items: sourceItems});
+          }
+
+          if (sourceItems.length < targetNeeded && catIdx < categories.length) {
+            // If many tiny categories still weren't enough, fall back to a single-subrequest full fetch
+            const full = await loadAllRawItemsForType(session, rawType);
+            sourceItems = full.items;
+            hasMoreCategories = false;
+          } else {
+            hasMoreCategories = catIdx < categories.length;
+          }
+        } else {
+          const full = await loadAllRawItemsForType(session, rawType);
+          sourceItems = full.items;
+        }
+      }
+
       const yearsSet = new Set<string>();
       const genresSet = new Set<string>();
-      for (const item of catalog.items) {
+      for (const item of sourceItems) {
         if (item.year) yearsSet.add(item.year);
         for (const g of item.genres) genresSet.add(g);
       }
 
-      let filtered = catalog.items;
-      if (categoryId !== 'all') {
-        filtered = filtered.filter((item) => item.categoryId === categoryId);
-      }
+      let filtered = sourceItems;
       if (genre !== 'all') {
         filtered = filtered.filter((item) =>
           item.genres.some((g) => g.toLowerCase() === genre),
@@ -1263,17 +1682,28 @@ export async function handleApiRequest(request: Request, env: WorkerEnv): Promis
       }
 
       const total = filtered.length;
-      const totalPages = Math.max(1, Math.ceil(total / limit));
+      const computedPages = Math.max(1, Math.ceil(total / limit));
+      const totalPages = hasMoreCategories ? Math.max(page + 1, computedPages) : computedPages;
       const safePage = Math.min(page, totalPages);
       const start = (safePage - 1) * limit;
-      const paged = filtered.slice(start, start + limit);
+      const rawPaged = filtered.slice(start, start + limit);
+      const paged = await materializeMediaItems(rawPaged, env);
+
+      console.info('[GreenPlay API] catalog', {
+        type: rawType,
+        categoryId,
+        page: safePage,
+        returned: paged.length,
+        durationMs: Date.now() - startedAt,
+      });
 
       const response: PaginatedCatalogResponse = {
         items: paged,
         total,
         page: safePage,
         totalPages,
-        categories: catalog.categories,
+        hasMore: hasMoreCategories || safePage < totalPages,
+        categories,
         years: [...yearsSet].sort((a, b) => Number(b) - Number(a)),
         genres: [...genresSet].slice(0, 40),
       };
@@ -1283,23 +1713,51 @@ export async function handleApiRequest(request: Request, env: WorkerEnv): Promis
     // Item Detail (/api/iptv/item/:type/:id)
     const itemMatch = pathname.match(/^\/api\/iptv\/item\/([^/]+)\/([^/]+)$/);
     if (itemMatch && method === 'GET') {
+      const startedAt = Date.now();
       const type = decodeURIComponent(itemMatch[1]);
       const id = decodeURIComponent(itemMatch[2]);
       if (type !== 'movie' && type !== 'series' && type !== 'live') {
         return jsonResponse({error: 'Tipo inválido.'}, 400);
       }
 
-      const catalog = await loadCatalogForType(session, type, env);
-      const baseItem = catalog.items.find((i) => i.id === id);
-      if (!baseItem) {
-        return jsonResponse({error: 'Conteúdo não encontrado na sua lista.'}, 404);
+      const scopeHash = await getSessionScopeHash(session);
+
+      // Try locating item in already-cached categories or full cache before downloading entire catalog
+      let baseRaw: RawCatalogItem | undefined;
+      let poolForRelated: RawCatalogItem[] = [];
+
+      if (session.mode === 'm3u') {
+        const m3u = await ensureM3UCatalog(session, type);
+        baseRaw = m3u.items.find((i) => i.id === id);
+        poolForRelated = m3u.items;
+      } else {
+        const cachedFull = await getCachedJson<RawTypeCatalog>(`allitems-${scopeHash}-${type}`);
+        if (cachedFull) {
+          baseRaw = cachedFull.items.find((i) => i.id === id);
+          poolForRelated = cachedFull.items;
+        } else {
+          // Search cached per-category entries for this user first
+          const prefix = `catitems-${scopeHash}-${type}-`;
+          for (const [k, v] of memoryCatalogCache.entries()) {
+            if (k.startsWith(prefix) && v.expiresAt > Date.now()) {
+              const catArr = v.data as RawCatalogItem[];
+              const hit = catArr.find((i) => i.id === id);
+              if (hit) {
+                baseRaw = hit;
+                poolForRelated = catArr;
+                break;
+              }
+            }
+          }
+        }
       }
 
-      const related = catalog.items
-        .filter((i) => i.id !== id && i.categoryId === baseItem.categoryId)
-        .slice(0, 12);
-
-      const scopeHash = await getSessionScopeHash(session);
+      const relatedRaw = baseRaw
+        ? poolForRelated
+            .filter((i) => i.id !== id && i.categoryId === baseRaw!.categoryId)
+            .slice(0, 12)
+        : [];
+      const related = await materializeMediaItems(relatedRaw, env);
 
       if (type === 'movie') {
         if (session.mode === 'xtream') {
@@ -1313,53 +1771,84 @@ export async function handleApiRequest(request: Request, env: WorkerEnv): Promis
               info?: Record<string, unknown>;
               movie_data?: Record<string, unknown>;
             }>(session, 'get_vod_info', {vod_id: id});
+
             const info = vodInfo?.info || {};
             const movieData = vodInfo?.movie_data || {};
             const dur = formatDurationMinutes(info.duration || info.duration_secs);
             const backdropList = Array.isArray(info.backdrop_path) ? info.backdrop_path : [];
             const bannerRaw = backdropList[0]
               ? String(backdropList[0])
-              : String(info.movie_image || '');
+              : String(info.movie_image || baseRaw?.rawBanner || '');
+            const posterRaw = String(info.movie_image || baseRaw?.rawPoster || '');
+            const poster = await createImageProxyUrl(posterRaw, env);
+            const banner = (await createImageProxyUrl(bannerRaw, env)) || poster;
+
+            const streamId = String(movieData.stream_id || id);
+            const ext = String(
+              movieData.container_extension || baseRaw?.containerExt || 'mp4',
+            );
+            const direct =
+              session.serverUrl && session.username && session.password
+                ? buildDirectXtreamUrl(session, 'movie', streamId, ext)
+                : undefined;
+
             const enriched: MediaItem = {
-              ...baseItem,
-              description: String(info.plot || info.description || baseItem.description || '').trim(),
-              banner:
-                (await createImageProxyUrl(bannerRaw, env)) ||
-                baseItem.banner ||
-                baseItem.poster,
-              poster:
-                (await createImageProxyUrl(String(info.movie_image || ''), env)) ||
-                baseItem.poster,
-              year: extractYear(info.releasedate || info.releaseDate) || baseItem.year,
-              duration: dur.label || baseItem.duration,
-              durationSeconds: dur.seconds || baseItem.durationSeconds,
+              id,
+              type: 'movie',
+              title: String(movieData.name || info.name || baseRaw?.title || `Filme ${id}`).trim(),
+              description: String(
+                info.plot || info.description || baseRaw?.description || '',
+              ).trim(),
+              poster,
+              banner,
+              year: extractYear(info.releasedate || info.releaseDate) || baseRaw?.year,
+              duration: dur.label,
+              durationSeconds: dur.seconds,
               genres: info.genre
                 ? String(info.genre)
                     .split(/[,/|]/)
                     .map((g) => g.trim())
                     .filter(Boolean)
-                : baseItem.genres,
-              rating: info.rating ? String(info.rating) : baseItem.rating,
+                : baseRaw?.genres || ['Filme'],
+              categoryId: String(movieData.category_id || baseRaw?.categoryId || ''),
+              categoryName: baseRaw?.categoryName,
+              rating: info.rating ? String(info.rating) : baseRaw?.rating,
+              streamUrl: direct?.streamUrl,
+              streamFormat: direct?.streamFormat,
             };
-            if (
-              movieData.container_extension &&
-              session.serverUrl &&
-              session.username &&
-              session.password
-            ) {
-              const ext =
-                String(movieData.container_extension).replace(/[^a-z0-9]/gi, '') || 'mp4';
-              const upstream = `${session.serverUrl}/movie/${encodeURIComponent(session.username)}/${encodeURIComponent(session.password)}/${encodeURIComponent(id)}.${ext}`;
-              enriched.streamUrl = await createStreamProxyUrl(upstream, env);
-              enriched.streamFormat = ext === 'm3u8' ? 'hls' : 'mp4';
+
+            if (direct) {
+              console.info('[GreenPlay Playback]', {
+                type: 'movie',
+                id: streamId,
+                format: direct.streamFormat,
+                url: redactUrlForLog(direct.streamUrl),
+                durationMs: Date.now() - startedAt,
+              });
             }
+
             await setCachedJson(detailKey, enriched);
             return jsonResponse({item: enriched, related});
           } catch {
-            // Fall back to baseItem
+            // Fall back to baseRaw + direct stream URL if available
           }
         }
-        return jsonResponse({item: baseItem, related});
+
+        if (!baseRaw) {
+          return jsonResponse({error: 'Conteúdo não encontrado na sua lista.'}, 404);
+        }
+        const materialized = await materializeMediaItem(baseRaw, env, session.mode === 'm3u');
+        if (session.mode === 'xtream' && !materialized.streamUrl) {
+          const direct = buildDirectXtreamUrl(
+            session,
+            'movie',
+            baseRaw.id,
+            baseRaw.containerExt || 'mp4',
+          );
+          materialized.streamUrl = direct.streamUrl;
+          materialized.streamFormat = direct.streamFormat;
+        }
+        return jsonResponse({item: materialized, related});
       }
 
       if (type === 'series') {
@@ -1386,19 +1875,22 @@ export async function handleApiRequest(request: Request, env: WorkerEnv): Promis
                 const sMeta = seasonMetaList.find((s) => Number(s.season_number) === seasonNum);
                 const episodes: EpisodeItem[] = await Promise.all(
                   (Array.isArray(eps) ? eps : []).map(async (ep, epIdx) => {
-                    const epId = String(ep.id || `${id}-${seasonNum}-${epIdx + 1}`);
+                    const epId = ep.id ? String(ep.id) : '';
                     const epNum = Number(ep.episode_num || epIdx + 1);
-                    const ext =
-                      String(ep.container_extension || 'mp4').replace(/[^a-z0-9]/gi, '') || 'mp4';
+                    const ext = String(ep.container_extension || 'mp4');
                     const epInfo = (ep.info as Record<string, unknown>) || {};
                     const dur = formatDurationMinutes(epInfo.duration || epInfo.duration_secs);
+
                     let streamUrl: string | undefined;
-                    if (session.serverUrl && session.username && session.password) {
-                      const upstream = `${session.serverUrl}/series/${encodeURIComponent(session.username)}/${encodeURIComponent(session.password)}/${encodeURIComponent(epId)}.${ext}`;
-                      streamUrl = await createStreamProxyUrl(upstream, env);
+                    let streamFormat: StreamFormatType = detectStreamFormat(ext);
+                    if (epId && session.serverUrl && session.username && session.password) {
+                      const direct = buildDirectXtreamUrl(session, 'series', epId, ext);
+                      streamUrl = direct.streamUrl;
+                      streamFormat = direct.streamFormat;
                     }
+
                     return {
-                      id: epId,
+                      id: epId || `${id}-${seasonNum}-${epIdx + 1}`,
                       seriesId: id,
                       seasonNumber: seasonNum,
                       episodeNumber: epNum,
@@ -1411,7 +1903,7 @@ export async function handleApiRequest(request: Request, env: WorkerEnv): Promis
                         env,
                       ),
                       streamUrl,
-                      streamFormat: ext === 'm3u8' ? 'hls' : 'mp4',
+                      streamFormat,
                     };
                   }),
                 );
@@ -1429,25 +1921,38 @@ export async function handleApiRequest(request: Request, env: WorkerEnv): Promis
             const backdropList = Array.isArray(info.backdrop_path) ? info.backdrop_path : [];
             const bannerRaw = backdropList[0]
               ? String(backdropList[0])
-              : String(info.cover || '');
+              : String(info.cover || baseRaw?.rawBanner || '');
+            const poster = await createImageProxyUrl(
+              String(info.cover || baseRaw?.rawPoster || ''),
+              env,
+            );
+            const banner = (await createImageProxyUrl(bannerRaw, env)) || poster;
+
             const detail: SeriesDetail = {
-              ...baseItem,
-              description: String(info.plot || baseItem.description || '').trim(),
-              poster:
-                (await createImageProxyUrl(String(info.cover || ''), env)) || baseItem.poster,
-              banner:
-                (await createImageProxyUrl(bannerRaw, env)) ||
-                baseItem.banner ||
-                baseItem.poster,
-              year: extractYear(info.releaseDate) || baseItem.year,
+              id,
+              type: 'series',
+              title: String(info.name || baseRaw?.title || `Série ${id}`).trim(),
+              description: String(info.plot || baseRaw?.description || '').trim(),
+              poster,
+              banner,
+              year: extractYear(info.releaseDate) || baseRaw?.year,
               genres: info.genre
                 ? String(info.genre)
                     .split(/[,/|]/)
                     .map((g) => g.trim())
                     .filter(Boolean)
-                : baseItem.genres,
+                : baseRaw?.genres || ['Série'],
+              categoryId: String(info.category_id || baseRaw?.categoryId || ''),
+              categoryName: baseRaw?.categoryName,
+              rating: info.rating ? String(info.rating) : baseRaw?.rating,
               seasons,
             };
+
+            console.info('[GreenPlay API] series-detail', {
+              seriesId: id,
+              seasons: seasons.length,
+              durationMs: Date.now() - startedAt,
+            });
 
             await setCachedJson(detailKey, detail);
             return jsonResponse({item: detail, related});
@@ -1456,23 +1961,27 @@ export async function handleApiRequest(request: Request, env: WorkerEnv): Promis
           }
         }
 
+        if (!baseRaw) {
+          return jsonResponse({error: 'Série não encontrada na sua lista.'}, 404);
+        }
+        const materialized = await materializeMediaItem(baseRaw, env, session.mode === 'm3u');
         const fallbackDetail: SeriesDetail = {
-          ...baseItem,
-          seasons: baseItem.streamUrl
+          ...materialized,
+          seasons: materialized.streamUrl
             ? [
                 {
                   seasonNumber: 1,
                   name: 'Temporada 1',
                   episodes: [
                     {
-                      id: `${baseItem.id}-ep1`,
-                      seriesId: baseItem.id,
+                      id: `${materialized.id}-ep1`,
+                      seriesId: materialized.id,
                       seasonNumber: 1,
                       episodeNumber: 1,
-                      title: baseItem.title,
-                      description: baseItem.description,
-                      streamUrl: baseItem.streamUrl,
-                      streamFormat: baseItem.streamFormat,
+                      title: materialized.title,
+                      description: materialized.description,
+                      streamUrl: materialized.streamUrl,
+                      streamFormat: materialized.streamFormat,
                     },
                   ],
                 },
@@ -1482,7 +1991,11 @@ export async function handleApiRequest(request: Request, env: WorkerEnv): Promis
         return jsonResponse({item: fallbackDetail, related});
       }
 
-      return jsonResponse({item: baseItem, related});
+      if (!baseRaw) {
+        return jsonResponse({error: 'Conteúdo não encontrado na sua lista.'}, 404);
+      }
+      const materialized = await materializeMediaItem(baseRaw, env, true);
+      return jsonResponse({item: materialized, related});
     }
 
     // Global Search
@@ -1492,27 +2005,37 @@ export async function handleApiRequest(request: Request, env: WorkerEnv): Promis
         return jsonResponse({movies: [], series: [], live: [], episodes: []} satisfies GlobalSearchResponse);
       }
 
+      const scopeHash = await getSessionScopeHash(session);
       const [moviesRes, seriesRes, liveRes] = await Promise.allSettled([
-        loadCatalogForType(session, 'movie', env),
-        loadCatalogForType(session, 'series', env),
-        loadCatalogForType(session, 'live', env),
+        loadAllRawItemsForType(session, 'movie'),
+        loadAllRawItemsForType(session, 'series'),
+        loadAllRawItemsForType(session, 'live'),
       ]);
 
-      const movies =
+      const rawMovies =
         moviesRes.status === 'fulfilled'
           ? moviesRes.value.items.filter((i) => i.title.toLowerCase().includes(q)).slice(0, 18)
           : [];
-      const series =
+      const rawSeries =
         seriesRes.status === 'fulfilled'
           ? seriesRes.value.items.filter((i) => i.title.toLowerCase().includes(q)).slice(0, 18)
           : [];
-      const live =
+      const rawLive =
         liveRes.status === 'fulfilled'
           ? liveRes.value.items.filter((i) => i.title.toLowerCase().includes(q)).slice(0, 18)
           : [];
 
+      const [movies, series, live] = await Promise.all([
+        materializeMediaItems(rawMovies, env),
+        materializeMediaItems(rawSeries, env),
+        materializeMediaItems(rawLive, env),
+      ]);
+
+      // Search cached series details scoped strictly to the current user's scopeHash
       const episodes: GlobalSearchResponse['episodes'] = [];
-      for (const entry of memoryCatalogCache.values()) {
+      const serPrefix = `ser-${scopeHash}-`;
+      for (const [cacheKey, entry] of memoryCatalogCache.entries()) {
+        if (!cacheKey.startsWith(serPrefix) || entry.expiresAt <= Date.now()) continue;
         const candidate = entry.data as Partial<SeriesDetail> | undefined;
         if (candidate && Array.isArray(candidate.seasons) && candidate.title) {
           for (const season of candidate.seasons) {
