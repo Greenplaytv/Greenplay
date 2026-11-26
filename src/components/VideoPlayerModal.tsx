@@ -57,7 +57,7 @@ const FIT_MODE_OPTIONS: {value: VideoFitMode; label: string; shortLabel: string}
 
 const INTRO_SKIP_SECONDS = 85;
 const INTRO_WINDOW_MAX_SECONDS = 300;
-const JUMP_TEN_MIN_SECONDS = 600;
+const SEEK_STEP_SECONDS = 10;
 
 interface VideoPlayerModalProps {
   target: PlayerTarget;
@@ -833,10 +833,10 @@ export const VideoPlayerModal: React.FC<VideoPlayerModalProps> = ({
     scheduleHideControls();
   };
 
-  const handleJumpTenMinutes = (direction: -1 | 1) => {
+  const handleJumpSeconds = (direction: -1 | 1) => {
     const video = videoRef.current;
     if (!video) return;
-    const delta = direction * JUMP_TEN_MIN_SECONDS;
+    const delta = direction * SEEK_STEP_SECONDS;
 
     if (target.mediaType === 'live') {
       if (video.seekable && video.seekable.length > 0) {
@@ -1125,23 +1125,23 @@ export const VideoPlayerModal: React.FC<VideoPlayerModalProps> = ({
 
               <button
                 type="button"
-                onClick={() => handleJumpTenMinutes(-1)}
+                onClick={() => handleJumpSeconds(-1)}
                 className="min-h-[44px] min-w-[44px] px-2.5 sm:px-3 inline-flex items-center justify-center gap-1 rounded-xl bg-white/10 hover:bg-white/20 text-white text-xs font-mono font-semibold tabular-nums transition-colors cursor-pointer"
-                aria-label="Voltar 10 minutos"
-                title="Voltar 10 minutos"
+                aria-label="Voltar 10 segundos"
+                title="Voltar 10 segundos"
               >
                 <RotateCcw className="h-4 w-4 shrink-0" />
-                <span>10m</span>
+                <span>10s</span>
               </button>
 
               <button
                 type="button"
-                onClick={() => handleJumpTenMinutes(1)}
+                onClick={() => handleJumpSeconds(1)}
                 className="min-h-[44px] min-w-[44px] px-2.5 sm:px-3 inline-flex items-center justify-center gap-1 rounded-xl bg-white/10 hover:bg-white/20 text-white text-xs font-mono font-semibold tabular-nums transition-colors cursor-pointer"
-                aria-label="Adiantar 10 minutos"
-                title="Adiantar 10 minutos"
+                aria-label="Adiantar 10 segundos"
+                title="Adiantar 10 segundos"
               >
-                <span>10m</span>
+                <span>10s</span>
                 <RotateCw className="h-4 w-4 shrink-0" />
               </button>
 
