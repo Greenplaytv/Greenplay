@@ -14,6 +14,7 @@ import {
   Plug,
   Radio,
   RotateCcw,
+  RotateCw,
   Scan,
   SkipForward,
   Volume2,
@@ -56,6 +57,7 @@ const FIT_MODE_OPTIONS: {value: VideoFitMode; label: string; shortLabel: string}
 
 const INTRO_SKIP_SECONDS = 85;
 const INTRO_WINDOW_MAX_SECONDS = 300;
+const JUMP_TEN_MIN_SECONDS = 600;
 
 interface VideoPlayerModalProps {
   target: PlayerTarget;
@@ -831,6 +833,34 @@ export const VideoPlayerModal: React.FC<VideoPlayerModalProps> = ({
     scheduleHideControls();
   };
 
+  const handleJumpTenMinutes = (direction: -1 | 1) => {
+    const video = videoRef.current;
+    if (!video) return;
+    const delta = direction * JUMP_TEN_MIN_SECONDS;
+
+    if (target.mediaType === 'live') {
+      if (video.seekable && video.seekable.length > 0) {
+        const minSeek = video.seekable.start(0);
+        const maxSeek = video.seekable.end(video.seekable.length - 1);
+        const nextPos = Math.min(Math.max(video.currentTime + delta, minSeek), maxSeek);
+        video.currentTime = nextPos;
+        setCurrentTime(nextPos);
+      }
+      scheduleHideControls();
+      return;
+    }
+
+    const maxTarget =
+      Number.isFinite(video.duration) && video.duration > 2
+        ? video.duration - 2
+        : Number.MAX_SAFE_INTEGER;
+    const nextPos = Math.min(Math.max(0, video.currentTime + delta), maxTarget);
+    video.currentTime = nextPos;
+    setCurrentTime(nextPos);
+    flushProgress(true);
+    scheduleHideControls();
+  };
+
   const handleManualRetry = () => {
     teardownPlayback();
     autoRetryCountRef.current = 0;
@@ -1078,8 +1108,8 @@ export const VideoPlayerModal: React.FC<VideoPlayerModalProps> = ({
             </div>
           )}
 
-          <div className="flex items-center justify-between gap-2 sm:gap-3">
-            <div className="flex items-center gap-2 sm:gap-3">
+          <div className="flex flex-wrap items-center justify-between gap-2 sm:gap-3">
+            <div className="flex items-center gap-1.5 sm:gap-2.5">
               <button
                 type="button"
                 onClick={togglePlay}
@@ -1091,6 +1121,28 @@ export const VideoPlayerModal: React.FC<VideoPlayerModalProps> = ({
                 ) : (
                   <Play className="h-5 w-5 fill-current ml-0.5" />
                 )}
+              </button>
+
+              <button
+                type="button"
+                onClick={() => handleJumpTenMinutes(-1)}
+                className="min-h-[44px] min-w-[44px] px-2.5 sm:px-3 inline-flex items-center justify-center gap-1 rounded-xl bg-white/10 hover:bg-white/20 text-white text-xs font-mono font-semibold tabular-nums transition-colors cursor-pointer"
+                aria-label="Voltar 10 minutos"
+                title="Voltar 10 minutos"
+              >
+                <RotateCcw className="h-4 w-4 shrink-0" />
+                <span>10m</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => handleJumpTenMinutes(1)}
+                className="min-h-[44px] min-w-[44px] px-2.5 sm:px-3 inline-flex items-center justify-center gap-1 rounded-xl bg-white/10 hover:bg-white/20 text-white text-xs font-mono font-semibold tabular-nums transition-colors cursor-pointer"
+                aria-label="Adiantar 10 minutos"
+                title="Adiantar 10 minutos"
+              >
+                <span>10m</span>
+                <RotateCw className="h-4 w-4 shrink-0" />
               </button>
 
               <button
@@ -1118,19 +1170,19 @@ export const VideoPlayerModal: React.FC<VideoPlayerModalProps> = ({
               />
 
               {target.mediaType === 'live' && (
-                <span className="ml-2 inline-flex items-center gap-1.5 text-xs font-semibold tracking-wider text-emerald-400 uppercase">
+                <span className="ml-1 sm:ml-2 inline-flex items-center gap-1.5 text-xs font-semibold tracking-wider text-emerald-400 uppercase">
                   <span className="h-2 w-2 rounded-full bg-emerald-400 animate-pulse" />
                   AO VIVO
                 </span>
               )}
             </div>
 
-            <div className="flex items-center gap-2">
+            <div className="flex items-center gap-1.5 sm:gap-2">
               {nextEpisode && onSelectEpisode && (
                 <button
                   type="button"
                   onClick={() => onSelectEpisode(nextEpisode)}
-                  className="min-h-[44px] inline-flex items-center gap-2 px-3.5 rounded-xl bg-white/10 hover:bg-white/20 text-white text-xs sm:text-sm font-medium transition-colors cursor-pointer"
+                  className="min-h-[44px] inline-flex items-center gap-2 px-3 sm:px-3.5 rounded-xl bg-white/10 hover:bg-white/20 text-white text-xs sm:text-sm font-medium transition-colors cursor-pointer"
                 >
                   <SkipForward className="h-4 w-4 text-emerald-400" />
                   <span className="hidden sm:inline">Próximo episódio</span>
