@@ -67,22 +67,72 @@ const MAX_M3U_BYTES = 25 * 1024 * 1024; // 25MB cap
 const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder();
 
-// Ephemeral fallback secret per isolate if SESSION_SECRET env var is not yet configured
+// Ephemeral fallback secret shared via Edge Cache when SESSION_SECRET env var is not yet configured
+const FALLBACK_KEY_CACHE_URL = 'https://cache.greenplay.internal/__greenplay_session_key_v1';
 let isolateFallbackSecretBytes: Uint8Array | null = null;
 const memoryCatalogCache = new Map<string, {data: unknown; expiresAt: number}>();
 const inflightRequests = new Map<string, Promise<unknown>>();
 
-function getFallbackSecretBytes(): Uint8Array {
-  if (!isolateFallbackSecretBytes) {
-    isolateFallbackSecretBytes = crypto.getRandomValues(new Uint8Array(32));
+async function getFallbackSecretBytes(): Promise<Uint8Array> {
+  if (isolateFallbackSecretBytes) {
+    return isolateFallbackSecretBytes;
   }
-  return isolateFallbackSecretBytes;
+
+  return deduplicateTask('__fallback_session_secret', async () => {
+    if (isolateFallbackSecretBytes) {
+      return isolateFallbackSecretBytes;
+    }
+
+    const edgeCache = getEdgeCache();
+    if (edgeCache) {
+      try {
+        const hit = await edgeCache.match(new Request(FALLBACK_KEY_CACHE_URL));
+        if (hit) {
+          const hex = (await hit.text()).trim();
+          if (/^[0-9a-f]{64}$/i.test(hex)) {
+            const bytes = new Uint8Array(32);
+            for (let i = 0; i < 32; i++) {
+              bytes[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+            }
+            isolateFallbackSecretBytes = bytes;
+            return bytes;
+          }
+        }
+      } catch {
+        // Ignore edge cache read failures
+      }
+    }
+
+    const generated = crypto.getRandomValues(new Uint8Array(32));
+    isolateFallbackSecretBytes = generated;
+
+    if (edgeCache) {
+      try {
+        const hex = Array.from(generated)
+          .map((b) => b.toString(16).padStart(2, '0'))
+          .join('');
+        await edgeCache.put(
+          new Request(FALLBACK_KEY_CACHE_URL),
+          new Response(hex, {
+            headers: {
+              'Content-Type': 'text/plain',
+              'Cache-Control': `public, max-age=${SESSION_TTL_SEC}`,
+            },
+          }),
+        );
+      } catch {
+        // Ignore edge cache write failures
+      }
+    }
+
+    return generated;
+  });
 }
 
 async function getAesKey(env: WorkerEnv): Promise<CryptoKey> {
   const rawBytes = env.SESSION_SECRET
     ? textEncoder.encode(env.SESSION_SECRET)
-    : getFallbackSecretBytes();
+    : await getFallbackSecretBytes();
   const keyDigest = await crypto.subtle.digest('SHA-256', new Uint8Array(rawBytes));
   return crypto.subtle.importKey('raw', keyDigest, {name: 'AES-GCM'}, false, [
     'encrypt',

@@ -11,25 +11,80 @@ import type {
   SeriesDetail,
 } from '../types/catalog';
 
-// Session token is held strictly in JS memory (never localStorage or sessionStorage)
+type InMemoryAuthCredentials =
+  | {mode: 'xtream'; serverUrl: string; username: string; password: string}
+  | {mode: 'm3u'; m3uUrl: string};
+
+// Session token & renewal credentials are held strictly in JS memory (never localStorage or sessionStorage)
 let inMemoryBearerToken: string | null = null;
+let inMemoryAuthCredentials: InMemoryAuthCredentials | null = null;
 let authEpoch = 0;
 
 const CLIENT_CACHE_TTL_MS = 3 * 60 * 1000;
 const clientResponseCache = new Map<string, {data: unknown; expiresAt: number}>();
 const inflightGetRequests = new Map<string, Promise<unknown>>();
+let inflightRefreshPromise: Promise<boolean> | null = null;
 
 export function setAuthToken(token: string | null) {
   if (inMemoryBearerToken !== token) {
     authEpoch += 1;
     clientResponseCache.clear();
     inflightGetRequests.clear();
+    inflightRefreshPromise = null;
   }
   inMemoryBearerToken = token;
+  if (!token) {
+    inMemoryAuthCredentials = null;
+  }
 }
 
 export function hasAuthToken(): boolean {
   return Boolean(inMemoryBearerToken);
+}
+
+async function renewSessionToken(expectedEpoch: number): Promise<boolean> {
+  if (!inMemoryAuthCredentials || expectedEpoch !== authEpoch) {
+    return false;
+  }
+  if (inflightRefreshPromise) {
+    return inflightRefreshPromise;
+  }
+
+  const creds = inMemoryAuthCredentials;
+  inflightRefreshPromise = (async () => {
+    try {
+      const endpoint = creds.mode === 'xtream' ? '/api/auth/xtream' : '/api/auth/m3u';
+      const body =
+        creds.mode === 'xtream'
+          ? {serverUrl: creds.serverUrl, username: creds.username, password: creds.password}
+          : {m3uUrl: creds.m3uUrl};
+
+      const res = await fetch(endpoint, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(body),
+      });
+
+      if (!res.ok) {
+        return false;
+      }
+      const data = (await res.json().catch(() => null)) as {token?: string} | null;
+      if (!data?.token || expectedEpoch !== authEpoch) {
+        return false;
+      }
+
+      // Refresh token silently without clearing cached catalog entries
+      inMemoryBearerToken = data.token;
+      console.info('[GreenPlay Auth] Sessão renovada automaticamente');
+      return true;
+    } catch {
+      return false;
+    } finally {
+      inflightRefreshPromise = null;
+    }
+  })();
+
+  return inflightRefreshPromise;
 }
 
 async function apiFetch<T>(
@@ -58,7 +113,7 @@ async function apiFetch<T>(
     }
   }
 
-  const execute = async (): Promise<T> => {
+  const executeAttempt = async (allowRenewRetries: number): Promise<T> => {
     const startedAt = performance.now();
     const headers = new Headers(init.headers);
     if (inMemoryBearerToken) {
@@ -83,6 +138,20 @@ async function apiFetch<T>(
     const durationMs = Math.round(performance.now() - startedAt);
     const cleanEndpoint = path.split('?')[0];
     console.info('[GreenPlay API]', {endpoint: cleanEndpoint, status: res.status, durationMs});
+
+    // If a Worker isolate restarted/switched without shared SESSION_SECRET, renew seamlessly once
+    if (
+      res.status === 401 &&
+      allowRenewRetries > 0 &&
+      !path.startsWith('/api/auth/') &&
+      inMemoryAuthCredentials &&
+      epochAtCall === authEpoch
+    ) {
+      const renewed = await renewSessionToken(epochAtCall);
+      if (renewed && epochAtCall === authEpoch) {
+        return executeAttempt(allowRenewRetries - 1);
+      }
+    }
 
     const data = (await res.json().catch(() => ({}))) as T & {error?: string};
     if (!res.ok) {
@@ -116,14 +185,14 @@ async function apiFetch<T>(
   };
 
   if (method === 'GET') {
-    const promise = execute().finally(() => {
+    const promise = executeAttempt(2).finally(() => {
       inflightGetRequests.delete(cacheKey);
     });
     inflightGetRequests.set(cacheKey, promise);
     return promise;
   }
 
-  return execute();
+  return executeAttempt(2);
 }
 
 export async function loginXtream(params: {
@@ -136,6 +205,12 @@ export async function loginXtream(params: {
     body: JSON.stringify(params),
   });
   setAuthToken(result.token);
+  inMemoryAuthCredentials = {
+    mode: 'xtream',
+    serverUrl: params.serverUrl,
+    username: params.username,
+    password: params.password,
+  };
   return result;
 }
 
@@ -147,6 +222,10 @@ export async function loginM3U(params: {
     body: JSON.stringify(params),
   });
   setAuthToken(result.token);
+  inMemoryAuthCredentials = {
+    mode: 'm3u',
+    m3uUrl: params.m3uUrl,
+  };
   return result;
 }
 
