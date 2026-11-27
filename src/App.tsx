@@ -1,7 +1,9 @@
 import React, {useCallback, useEffect, useRef, useState} from 'react';
 import {AccountModal} from './components/AccountModal';
+import {BrandLogo} from './components/BrandLogo';
 import {Header, type AppRoute} from './components/Header';
 import {OfflineIndicator} from './components/OfflineIndicator';
+import {ValidityCountdown} from './components/ValidityCountdown';
 import {VideoPlayerModal} from './components/VideoPlayerModal';
 import {getDemoHomeCatalog, getDemoItemDetail} from './data/demoCatalog';
 import {useUserLibrary} from './hooks/useUserLibrary';
@@ -13,10 +15,12 @@ import {LoginPage} from './pages/LoginPage';
 import {MyListPage} from './pages/MyListPage';
 import {SearchPage} from './pages/SearchPage';
 import {
+  checkSavedSession,
   fetchHomeSection,
   fetchItemDetail,
   fetchPlaybackSource,
   logoutIptv,
+  setSessionExpiredListener,
 } from './services/iptvApi';
 import type {
   AuthSessionInfo,
@@ -36,8 +40,61 @@ const DEMO_SESSION: AuthSessionInfo = {
   capabilities: {live: false, movies: true, series: true},
 };
 
+const NAV_STORAGE_PREFIX = 'greenplay_nav_state:';
+const SAFE_NAV_ROUTES: AppRoute[] = ['home', 'movies', 'series', 'live', 'mylist', 'detail'];
+
+interface SavedNavState {
+  route: AppRoute;
+  catalogCategoryFilter: string;
+  detailTarget: {type: 'movie' | 'series'; id: string} | null;
+}
+
+function getAccountScope(s: AuthSessionInfo | null): string {
+  return s?.authenticated
+    ? `${s.mode}:${s.serverHost || ''}:${s.accountLabel}`
+    : 'demo';
+}
+
+function loadSavedNavState(scope: string): SavedNavState | null {
+  try {
+    const raw = localStorage.getItem(`${NAV_STORAGE_PREFIX}${scope}`);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as Partial<SavedNavState>;
+    if (!parsed.route || !SAFE_NAV_ROUTES.includes(parsed.route)) return null;
+    if (
+      parsed.route === 'detail' &&
+      (!parsed.detailTarget ||
+        (parsed.detailTarget.type !== 'movie' && parsed.detailTarget.type !== 'series') ||
+        typeof parsed.detailTarget.id !== 'string' ||
+        !parsed.detailTarget.id)
+    ) {
+      return null;
+    }
+    return {
+      route: parsed.route,
+      catalogCategoryFilter:
+        typeof parsed.catalogCategoryFilter === 'string' && parsed.catalogCategoryFilter
+          ? parsed.catalogCategoryFilter
+          : 'all',
+      detailTarget: parsed.detailTarget ?? null,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function clearSavedNavState(scope: string) {
+  try {
+    localStorage.removeItem(`${NAV_STORAGE_PREFIX}${scope}`);
+  } catch {
+    // Ignore storage access errors
+  }
+}
+
 export default function App() {
   const [session, setSession] = useState<AuthSessionInfo | null>(null);
+  const [checkingSession, setCheckingSession] = useState(true);
+  const [authNotice, setAuthNotice] = useState<string | null>(null);
   const [route, setRoute] = useState<AppRoute>('home');
   const [catalogCategoryFilter, setCatalogCategoryFilter] = useState<string>('all');
   const [detailTarget, setDetailTarget] = useState<{
@@ -58,13 +115,14 @@ export default function App() {
     live: null,
   });
   const loadedScopeRef = useRef<string | null>(null);
+  const sessionRef = useRef<AuthSessionInfo | null>(null);
+  const expiringRef = useRef(false);
 
   const [playerTarget, setPlayerTarget] = useState<PlayerTarget | null>(null);
   const [showAccountModal, setShowAccountModal] = useState(false);
 
-  const accountScope = session?.authenticated
-    ? `${session.mode}:${session.serverHost || ''}:${session.accountLabel}`
-    : 'demo';
+  sessionRef.current = session;
+  const accountScope = getAccountScope(session);
 
   const {
     favorites,
@@ -366,29 +424,143 @@ export default function App() {
     [upsertContinueWatching],
   );
 
-  const handleDisconnect = async () => {
-    await logoutIptv();
-    loadedScopeRef.current = null;
-    setSession(null);
-    setHomeCatalog(null);
-    setSectionLoading({movie: false, series: false, live: false});
-    setSectionErrors({movie: null, series: null, live: null});
-    setPlayerTarget(null);
-    setRoute('home');
-  };
+  const resetToLogin = useCallback(
+    async (notice: string | null = null, clearSavedNav = true) => {
+      const currentScope = getAccountScope(sessionRef.current);
+      if (clearSavedNav && currentScope !== 'demo') {
+        clearSavedNavState(currentScope);
+      }
+      await logoutIptv();
+      loadedScopeRef.current = null;
+      setSession(null);
+      setHomeCatalog(null);
+      setSectionLoading({movie: false, series: false, live: false});
+      setSectionErrors({movie: null, series: null, live: null});
+      setPlayerTarget(null);
+      setShowAccountModal(false);
+      setDetailTarget(null);
+      setCatalogCategoryFilter('all');
+      setRoute('home');
+      setAuthNotice(notice);
+    },
+    [],
+  );
+
+  const handleDisconnect = useCallback(
+    () => resetToLogin(null, true),
+    [resetToLogin],
+  );
+
+  const handleSessionExpired = useCallback(
+    async (message?: string) => {
+      if (expiringRef.current) return;
+      expiringRef.current = true;
+      try {
+        await resetToLogin(
+          message ||
+            'A validade desta lista IPTV expirou. Conecte uma nova lista.',
+          true,
+        );
+      } finally {
+        expiringRef.current = false;
+      }
+    },
+    [resetToLogin],
+  );
+
+  useEffect(() => {
+    setSessionExpiredListener((message) => {
+      void handleSessionExpired(message);
+    });
+    return () => {
+      setSessionExpiredListener(null);
+    };
+  }, [handleSessionExpired]);
+
+  useEffect(() => {
+    let active = true;
+    (async () => {
+      try {
+        const res = await checkSavedSession();
+        if (!active) return;
+        if (res.authenticated && res.session) {
+          const restoredScope = getAccountScope(res.session);
+          const savedNav = loadSavedNavState(restoredScope);
+          if (savedNav) {
+            setRoute(savedNav.route);
+            setCatalogCategoryFilter(savedNav.catalogCategoryFilter);
+            setDetailTarget(savedNav.detailTarget);
+          }
+          setAuthNotice(null);
+          setSession(res.session);
+        } else if (res.expired) {
+          setAuthNotice(
+            res.message ||
+              'A validade da sua lista IPTV salva expirou. Conecte uma nova lista.',
+          );
+        }
+      } finally {
+        if (active) {
+          setCheckingSession(false);
+        }
+      }
+    })();
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!session?.authenticated || session.mode === 'demo') return;
+    const payload: SavedNavState = {
+      route: SAFE_NAV_ROUTES.includes(route) ? route : 'home',
+      catalogCategoryFilter,
+      detailTarget: route === 'detail' ? detailTarget : null,
+    };
+    try {
+      localStorage.setItem(
+        `${NAV_STORAGE_PREFIX}${accountScope}`,
+        JSON.stringify(payload),
+      );
+    } catch {
+      // Ignore storage quota / privacy mode errors
+    }
+  }, [session, accountScope, route, catalogCategoryFilter, detailTarget]);
+
+  if (checkingSession) {
+    return (
+      <div className="min-h-screen bg-[#060807] text-[#F3F6F4] flex flex-col items-center justify-center px-6">
+        <BrandLogo size="lg" />
+        <div className="mt-6 flex items-center gap-2.5 text-sm text-[#98A69E]">
+          <span className="w-4 h-4 rounded-full border-2 border-[#00E676]/30 border-t-[#00E676] animate-spin" />
+          <span>Restaurando sua conexão IPTV...</span>
+        </div>
+        <OfflineIndicator />
+      </div>
+    );
+  }
 
   // Show IPTV Login screen until authenticated or user chooses Demo preview
   if (!session) {
     return (
       <>
         <LoginPage
+          noticeError={authNotice}
           onAuthenticated={(authSession) => {
             loadedScopeRef.current = null;
+            expiringRef.current = false;
+            setAuthNotice(null);
+            setDetailTarget(null);
+            setCatalogCategoryFilter('all');
             setSession(authSession);
             setRoute('home');
           }}
           onEnterDemo={() => {
             loadedScopeRef.current = null;
+            expiringRef.current = false;
+            setAuthNotice(null);
+            setDetailTarget(null);
+            setCatalogCategoryFilter('all');
             setSession(DEMO_SESSION);
             setRoute('home');
           }}
@@ -405,6 +577,7 @@ export default function App() {
         onNavigate={handleNavigate}
         session={session}
         onOpenAccount={() => setShowAccountModal(true)}
+        onSessionExpired={() => void handleSessionExpired()}
       />
 
       <main className="flex-1 pb-20 md:pb-0">
@@ -496,11 +669,20 @@ export default function App() {
       <footer className="hidden md:block border-t border-white/[0.06] py-6 px-10 text-xs text-[#6E7D75]">
         <div className="max-w-[1440px] mx-auto flex items-center justify-between gap-4">
           <span>GreenPlay TV — Plataforma de Streaming IPTV</span>
-          <span>
-            {session.mode === 'demo'
-              ? 'Modo Demonstração · Sem fontes de vídeo externas conectadas'
-              : `Conectado a ${session.serverHost || session.accountLabel}`}
-          </span>
+          <div className="flex items-center gap-4">
+            {session.mode !== 'demo' && (
+              <ValidityCountdown
+                expiresAtTimestamp={session.expiresAtTimestamp}
+                isTrial={session.isTrial}
+                variant="compact"
+              />
+            )}
+            <span>
+              {session.mode === 'demo'
+                ? 'Modo Demonstração · Sem fontes de vídeo externas conectadas'
+                : `Conectado a ${session.serverHost || session.accountLabel}`}
+            </span>
+          </div>
         </div>
       </footer>
 

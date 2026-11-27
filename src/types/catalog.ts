@@ -76,6 +76,9 @@ export interface AuthSessionInfo {
   serverHost?: string;
   status?: string;
   expiresAt?: string;
+  expiresAtTimestamp?: number;
+  createdAtTimestamp?: number;
+  isTrial?: boolean;
   maxConnections?: string;
   activeConnections?: string;
   capabilities: {
@@ -83,6 +86,13 @@ export interface AuthSessionInfo {
     movies: boolean;
     series: boolean;
   };
+}
+
+export interface SessionCheckResponse {
+  authenticated: boolean;
+  expired?: boolean;
+  message?: string;
+  session?: AuthSessionInfo;
 }
 
 export interface HomeCatalogResponse {

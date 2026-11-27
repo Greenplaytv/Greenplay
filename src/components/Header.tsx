@@ -11,6 +11,7 @@ import {
 import type {AuthSessionInfo} from '../types/catalog';
 import {BrandLogo} from './BrandLogo';
 import {PWAInstallPrompt} from './PWAInstallPrompt';
+import {ValidityCountdown} from './ValidityCountdown';
 
 export type AppRoute =
   | 'home'
@@ -26,6 +27,7 @@ interface HeaderProps {
   onNavigate: (route: AppRoute) => void;
   session: AuthSessionInfo;
   onOpenAccount: () => void;
+  onSessionExpired?: () => void;
 }
 
 const NAV_ITEMS: {route: AppRoute; label: string; icon: React.ComponentType<{className?: string}>}[] = [
@@ -41,6 +43,7 @@ export const Header: React.FC<HeaderProps> = ({
   onNavigate,
   session,
   onOpenAccount,
+  onSessionExpired,
 }) => {
   return (
     <>
@@ -96,6 +99,16 @@ export const Header: React.FC<HeaderProps> = ({
 
             <PWAInstallPrompt />
 
+            {session.mode !== 'demo' && (
+              <ValidityCountdown
+                expiresAtTimestamp={session.expiresAtTimestamp}
+                isTrial={session.isTrial}
+                variant="header"
+                onClick={onOpenAccount}
+                onExpired={onSessionExpired}
+              />
+            )}
+
             <button
               type="button"
               onClick={onOpenAccount}
@@ -134,6 +147,22 @@ export const Header: React.FC<HeaderProps> = ({
             </button>
           </div>
         </div>
+
+        {/* Mobile Compact Validity Countdown Strip when IPTV list is connected */}
+        {session.mode !== 'demo' && (
+          <div className="flex md:hidden items-center justify-between gap-3 px-4 py-1.5 bg-[#090D0B] border-t border-white/[0.04] text-[11px]">
+            <span className="text-[#8C9B93] truncate">
+              {session.isTrial ? 'Teste IPTV' : session.accountLabel}
+            </span>
+            <ValidityCountdown
+              expiresAtTimestamp={session.expiresAtTimestamp}
+              isTrial={session.isTrial}
+              variant="compact"
+              onClick={onOpenAccount}
+              onExpired={onSessionExpired}
+            />
+          </div>
+        )}
       </header>
 
       {/* Mobile Bottom Thumb-Zone Navigation (60px + safe area) */}

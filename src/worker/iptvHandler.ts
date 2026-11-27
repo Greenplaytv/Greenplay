@@ -58,7 +58,8 @@ interface RawTypeCatalog {
   fetchedAt: number;
 }
 
-const SESSION_TTL_SEC = 12 * 60 * 60; // 12 hours
+const SESSION_TTL_SEC = 30 * 24 * 60 * 60; // 30 days persistent session (capped by real provider expiration)
+const SESSION_COOKIE_NAME = 'greenplay_session';
 const STREAM_TOKEN_TTL_SEC = 4 * 60 * 60; // 4 hours
 const CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
 const XTREAM_TIMEOUT_MS = 25000; // 25 seconds for larger provider responses
@@ -1168,26 +1169,139 @@ async function resolvePlaybackSource(
   return resolved;
 }
 
-// --- Response Helpers ---
+// --- Response, Cookie, Expiration & Security Helpers ---
 
-function jsonResponse(data: unknown, status = 200): Response {
+function jsonResponse(
+  data: unknown,
+  status = 200,
+  extraHeaders: Record<string, string> = {},
+): Response {
   return new Response(JSON.stringify(data), {
     status,
     headers: {
       'Content-Type': 'application/json; charset=utf-8',
       'Cache-Control': 'no-store',
+      ...extraHeaders,
     },
   });
+}
+
+function parseProviderTimestamp(raw: unknown): number | undefined {
+  if (raw === null || raw === undefined) return undefined;
+  const str = String(raw).trim();
+  if (!str || str === '0' || /^null$/i.test(str) || /^unlimited$/i.test(str)) {
+    return undefined;
+  }
+  if (/^\d+$/.test(str)) {
+    const num = Number(str);
+    if (!Number.isFinite(num) || num <= 0) return undefined;
+    // Xtream Codes uses Unix seconds (10 digits), normalize ms if >= 1e12
+    return num >= 1e12 ? num : num * 1000;
+  }
+  const parsed = Date.parse(str);
+  if (!Number.isFinite(parsed) || parsed <= 0) return undefined;
+  return parsed;
+}
+
+function formatExpirationPtBr(timestampMs: number): string {
+  return new Date(timestampMs).toLocaleString('pt-BR', {
+    day: '2-digit',
+    month: '2-digit',
+    year: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+  });
+}
+
+function computeSessionTtlSeconds(expiresAtTimestamp?: number): number {
+  if (!expiresAtTimestamp) return SESSION_TTL_SEC;
+  const remainingSec = Math.floor((expiresAtTimestamp - Date.now()) / 1000);
+  return Math.max(1, Math.min(SESSION_TTL_SEC, remainingSec));
+}
+
+function parseCookies(request: Request): Map<string, string> {
+  const map = new Map<string, string>();
+  const cookieHeader = request.headers.get('cookie');
+  if (!cookieHeader) return map;
+  for (const part of cookieHeader.split(';')) {
+    const eqIdx = part.indexOf('=');
+    if (eqIdx <= 0) continue;
+    const name = part.slice(0, eqIdx).trim();
+    const val = part.slice(eqIdx + 1).trim();
+    if (!name) continue;
+    try {
+      map.set(name, decodeURIComponent(val));
+    } catch {
+      map.set(name, val);
+    }
+  }
+  return map;
+}
+
+function isSecureRequest(request: Request, url: URL): boolean {
+  if (url.protocol === 'https:') return true;
+  const proto = request.headers.get('x-forwarded-proto');
+  return Boolean(proto && proto.split(',')[0].trim().toLowerCase() === 'https');
+}
+
+function buildSessionCookieHeader(token: string, maxAgeSec: number, isSecure: boolean): string {
+  const encoded = encodeURIComponent(token);
+  if (isSecure) {
+    return `${SESSION_COOKIE_NAME}=${encoded}; HttpOnly; Secure; SameSite=None; Partitioned; Path=/; Max-Age=${maxAgeSec}`;
+  }
+  return `${SESSION_COOKIE_NAME}=${encoded}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${maxAgeSec}`;
+}
+
+function buildClearSessionCookieHeader(isSecure: boolean): string {
+  if (isSecure) {
+    return `${SESSION_COOKIE_NAME}=; HttpOnly; Secure; SameSite=None; Partitioned; Path=/; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT`;
+  }
+  return `${SESSION_COOKIE_NAME}=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT`;
+}
+
+function verifyStateChangingRequest(request: Request): boolean {
+  if (request.headers.get('X-Requested-With')) {
+    return true;
+  }
+  const origin = request.headers.get('Origin');
+  const expectedHost =
+    request.headers.get('X-Forwarded-Host')?.split(',')[0].trim() ||
+    request.headers.get('Host');
+  if (origin && expectedHost) {
+    try {
+      const originHost = new URL(origin).host;
+      return originHost.toLowerCase() === expectedHost.toLowerCase();
+    } catch {
+      return false;
+    }
+  }
+  // Allow same-origin requests without Origin header (e.g. non-browser CLI checks)
+  return !origin;
 }
 
 async function resolveSession(
   request: Request,
   env: WorkerEnv,
-): Promise<SessionTokenPayload | null> {
+): Promise<{payload: SessionTokenPayload | null; expired: boolean}> {
   const auth = request.headers.get('Authorization');
-  if (!auth || !auth.startsWith('Bearer ')) return null;
-  const token = auth.slice(7).trim();
-  return decryptToken<SessionTokenPayload>(token, env);
+  let token: string | undefined;
+  if (auth && auth.startsWith('Bearer ')) {
+    token = auth.slice(7).trim();
+  } else {
+    token = parseCookies(request).get(SESSION_COOKIE_NAME);
+  }
+  if (!token) return {payload: null, expired: false};
+
+  const payload = await decryptToken<SessionTokenPayload>(token, env);
+  if (!payload) return {payload: null, expired: false};
+
+  if (
+    payload.info.expiresAtTimestamp &&
+    Date.now() >= payload.info.expiresAtTimestamp
+  ) {
+    return {payload: null, expired: true};
+  }
+  return {payload, expired: false};
 }
 
 // --- Main Fetch Router ---
@@ -1196,11 +1310,19 @@ export async function handleApiRequest(request: Request, env: WorkerEnv): Promis
   const url = new URL(request.url);
   const pathname = url.pathname;
   const method = request.method.toUpperCase();
+  const secureCookie = isSecureRequest(request, url);
 
   try {
     // Health check
     if (pathname === '/api/health' && method === 'GET') {
       return jsonResponse({status: 'ok'});
+    }
+
+    // CSRF protection for state-changing requests
+    if (method !== 'GET' && method !== 'HEAD' && method !== 'OPTIONS') {
+      if (!verifyStateChangingRequest(request)) {
+        return jsonResponse({error: 'Origem da requisição não autorizada.'}, 403);
+      }
     }
 
     // Xtream Codes Auth
@@ -1254,7 +1376,9 @@ export async function handleApiRequest(request: Request, env: WorkerEnv): Promis
         user_info?: {
           auth?: number | string;
           status?: string;
-          exp_date?: string | null;
+          exp_date?: string | number | null;
+          created_at?: string | number | null;
+          is_trial?: string | number | null;
           max_connections?: string | number;
           active_cons?: string | number;
           username?: string;
@@ -1324,13 +1448,23 @@ export async function handleApiRequest(request: Request, env: WorkerEnv): Promis
         );
       }
 
-      let expiresAt: string | undefined;
-      if (userInfo.exp_date && /^\d+$/.test(String(userInfo.exp_date))) {
-        const ts = Number(userInfo.exp_date) * 1000;
-        if (ts > 0) {
-          expiresAt = new Date(ts).toLocaleDateString('pt-BR');
-        }
+      const expiresAtTimestamp = parseProviderTimestamp(userInfo.exp_date);
+      const createdAtTimestamp = parseProviderTimestamp(userInfo.created_at);
+      const isTrial = String(userInfo.is_trial ?? '').trim() === '1';
+
+      if (expiresAtTimestamp && Date.now() >= expiresAtTimestamp) {
+        return jsonResponse(
+          {
+            error: `Lista IPTV expirada em ${formatExpirationPtBr(expiresAtTimestamp)}. Conecte uma nova lista ou renove com seu provedor.`,
+          },
+          403,
+          {'Set-Cookie': buildClearSessionCookieHeader(secureCookie)},
+        );
       }
+
+      const expiresAt = expiresAtTimestamp
+        ? formatExpirationPtBr(expiresAtTimestamp)
+        : undefined;
 
       const info: AuthSessionInfo = {
         authenticated: true,
@@ -1339,21 +1473,29 @@ export async function handleApiRequest(request: Request, env: WorkerEnv): Promis
         serverHost: parsedUrl.host,
         status: 'Ativa',
         expiresAt,
+        expiresAtTimestamp,
+        createdAtTimestamp,
+        isTrial: isTrial || undefined,
         maxConnections: userInfo.max_connections ? String(userInfo.max_connections) : undefined,
         activeConnections: userInfo.active_cons ? String(userInfo.active_cons) : undefined,
         capabilities: {live: true, movies: true, series: true},
       };
 
+      const ttlSec = computeSessionTtlSeconds(expiresAtTimestamp);
       const tokenPayload: SessionTokenPayload = {
         mode: 'xtream',
         serverUrl: baseOrigin,
         username: body.username.trim(),
         password: body.password,
         info,
-        exp: Math.floor(Date.now() / 1000) + SESSION_TTL_SEC,
+        exp: Math.floor(Date.now() / 1000) + ttlSec,
       };
       const token = await encryptToken(tokenPayload, env);
-      return jsonResponse({token, session: info});
+      return jsonResponse(
+        {token, session: info},
+        200,
+        {'Set-Cookie': buildSessionCookieHeader(token, ttlSec, secureCookie)},
+      );
     }
 
     // M3U URL Auth
@@ -1459,17 +1601,57 @@ export async function handleApiRequest(request: Request, env: WorkerEnv): Promis
       ]);
 
       const token = await encryptToken(tokenPayload, env);
-      return jsonResponse({token, session: info});
+      return jsonResponse(
+        {token, session: info},
+        200,
+        {'Set-Cookie': buildSessionCookieHeader(token, SESSION_TTL_SEC, secureCookie)},
+      );
     }
 
     if (pathname === '/api/auth/session' && method === 'GET') {
-      const session = await resolveSession(request, env);
-      if (!session) return jsonResponse({authenticated: false});
-      return jsonResponse(session.info);
+      const resolved = await resolveSession(request, env);
+      if (resolved.expired) {
+        return jsonResponse(
+          {
+            authenticated: false,
+            expired: true,
+            message: 'A validade da sua lista IPTV expirou. Conecte uma nova lista.',
+          },
+          200,
+          {'Set-Cookie': buildClearSessionCookieHeader(secureCookie)},
+        );
+      }
+      if (!resolved.payload) {
+        return jsonResponse({authenticated: false});
+      }
+
+      const payload = resolved.payload;
+      const ttlSec = computeSessionTtlSeconds(payload.info.expiresAtTimestamp);
+      const nowSec = Math.floor(Date.now() / 1000);
+
+      // Renew rolling cookie window when approaching expiry while preserving exact original expiresAtTimestamp
+      if (payload.exp - nowSec < Math.floor(ttlSec / 2)) {
+        const refreshedPayload: SessionTokenPayload = {
+          ...payload,
+          exp: nowSec + ttlSec,
+        };
+        const refreshedToken = await encryptToken(refreshedPayload, env);
+        return jsonResponse(
+          {authenticated: true, session: payload.info},
+          200,
+          {'Set-Cookie': buildSessionCookieHeader(refreshedToken, ttlSec, secureCookie)},
+        );
+      }
+
+      return jsonResponse({authenticated: true, session: payload.info});
     }
 
     if (pathname === '/api/auth/logout' && method === 'POST') {
-      return jsonResponse({ok: true});
+      return jsonResponse(
+        {ok: true},
+        200,
+        {'Set-Cookie': buildClearSessionCookieHeader(secureCookie)},
+      );
     }
 
     // Owner-configured optional Live TV playlist
@@ -1537,13 +1719,24 @@ export async function handleApiRequest(request: Request, env: WorkerEnv): Promis
     }
 
     // Authenticated Catalog Routes
-    const session = await resolveSession(request, env);
-    if (!session) {
+    const sessionCheck = await resolveSession(request, env);
+    if (!sessionCheck.payload) {
+      if (sessionCheck.expired) {
+        return jsonResponse(
+          {
+            error: 'A validade desta lista IPTV expirou. Conecte uma nova lista.',
+            expired: true,
+          },
+          401,
+          {'Set-Cookie': buildClearSessionCookieHeader(secureCookie)},
+        );
+      }
       return jsonResponse(
         {error: 'Sessão não autenticada ou expirada. Conecte sua lista IPTV.'},
         401,
       );
     }
+    const session = sessionCheck.payload;
 
     // Progressive single-type Home section (renders movies/series/live as soon as ready)
     if (pathname === '/api/iptv/home-section' && method === 'GET') {

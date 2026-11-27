@@ -9,6 +9,7 @@ import type {
   PaginatedCatalogResponse,
   PlaybackSourceResponse,
   SeriesDetail,
+  SessionCheckResponse,
 } from '../types/catalog';
 
 type InMemoryAuthCredentials =
@@ -24,6 +25,11 @@ const CLIENT_CACHE_TTL_MS = 3 * 60 * 1000;
 const clientResponseCache = new Map<string, {data: unknown; expiresAt: number}>();
 const inflightGetRequests = new Map<string, Promise<unknown>>();
 let inflightRefreshPromise: Promise<boolean> | null = null;
+let sessionExpiredListener: ((message: string) => void) | null = null;
+
+export function setSessionExpiredListener(cb: ((message: string) => void) | null) {
+  sessionExpiredListener = cb;
+}
 
 export function setAuthToken(token: string | null) {
   if (inMemoryBearerToken !== token) {
@@ -61,7 +67,11 @@ async function renewSessionToken(expectedEpoch: number): Promise<boolean> {
 
       const res = await fetch(endpoint, {
         method: 'POST',
-        headers: {'Content-Type': 'application/json'},
+        credentials: 'same-origin',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Requested-With': 'GreenPlay-SPA',
+        },
         body: JSON.stringify(body),
       });
 
@@ -116,6 +126,7 @@ async function apiFetch<T>(
   const executeAttempt = async (allowRenewRetries: number): Promise<T> => {
     const startedAt = performance.now();
     const headers = new Headers(init.headers);
+    headers.set('X-Requested-With', 'GreenPlay-SPA');
     if (inMemoryBearerToken) {
       headers.set('Authorization', `Bearer ${inMemoryBearerToken}`);
     }
@@ -127,6 +138,7 @@ async function apiFetch<T>(
     try {
       res = await fetch(path, {
         ...init,
+        credentials: 'same-origin',
         headers,
       });
     } catch {
@@ -138,6 +150,19 @@ async function apiFetch<T>(
     const durationMs = Math.round(performance.now() - startedAt);
     const cleanEndpoint = path.split('?')[0];
     console.info('[GreenPlay API]', {endpoint: cleanEndpoint, status: res.status, durationMs});
+
+    const data = (await res.json().catch(() => ({}))) as T & {
+      error?: string;
+      expired?: boolean;
+    };
+
+    if (res.status === 401 && data?.expired) {
+      const msg =
+        data.error || 'A validade desta lista IPTV expirou. Conecte uma nova lista.';
+      setAuthToken(null);
+      sessionExpiredListener?.(msg);
+      throw new Error(msg);
+    }
 
     // If a Worker isolate restarted/switched without shared SESSION_SECRET, renew seamlessly once
     if (
@@ -153,7 +178,6 @@ async function apiFetch<T>(
       }
     }
 
-    const data = (await res.json().catch(() => ({}))) as T & {error?: string};
     if (!res.ok) {
       if (data?.error) {
         throw new Error(data.error);
@@ -229,11 +253,18 @@ export async function loginM3U(params: {
   return result;
 }
 
+export async function checkSavedSession(): Promise<SessionCheckResponse> {
+  return apiFetch<SessionCheckResponse>('/api/auth/session', {
+    method: 'GET',
+    cache: 'no-store',
+  });
+}
+
 export async function logoutIptv(): Promise<void> {
   try {
-    if (inMemoryBearerToken) {
-      await apiFetch('/api/auth/logout', {method: 'POST'});
-    }
+    await apiFetch('/api/auth/logout', {method: 'POST'});
+  } catch {
+    // Always clear client state even if offline
   } finally {
     setAuthToken(null);
   }

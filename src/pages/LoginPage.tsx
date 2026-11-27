@@ -7,9 +7,14 @@ import type {AuthSessionInfo} from '../types/catalog';
 interface LoginPageProps {
   onAuthenticated: (session: AuthSessionInfo) => void;
   onEnterDemo: () => void;
+  noticeError?: string | null;
 }
 
-export const LoginPage: React.FC<LoginPageProps> = ({onAuthenticated, onEnterDemo}) => {
+export const LoginPage: React.FC<LoginPageProps> = ({
+  onAuthenticated,
+  onEnterDemo,
+  noticeError = null,
+}) => {
   const [authMode, setAuthMode] = useState<'xtream' | 'm3u'>('xtream');
   const [serverUrl, setServerUrl] = useState('');
   const [username, setUsername] = useState('');
@@ -18,7 +23,7 @@ export const LoginPage: React.FC<LoginPageProps> = ({onAuthenticated, onEnterDem
 
   const [m3uUrl, setM3uUrl] = useState('');
   const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(noticeError);
 
   const normalizeInputUrl = (value: string): string | null => {
     const trimmed = value.trim().replace(/^["']+|["']+$/g, '');
